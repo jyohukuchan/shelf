@@ -155,8 +155,11 @@ dense checkpoint を TP=2 で動かす場合:
 - dense checkpoint は `--tensor-parallel 2` に対応する。grouped expert（MoE）の TP では
   MTP block を rank に分割しないため、現行の MoE TP load は MTP を拒否する。
 - `--pipeline-parallel 2`、`--dump-logits` は未対応。
-- `--serve-stdio` は MTP を 1 request ずつ直列に処理する。`--max-concurrent-requests`
-  を 2 以上にしても、MTP の生成中は次の request を開始しない。
+- `--serve-stdio` は MTP の複数 request を同時に保持し、round ごとにまとめて進める
+  （継続バッチ）。同時に保持できる数は `--max-concurrent-requests` と、verify の行容量
+  （`max_batch_rows / (--mtp-drafts + 1)`）の小さい方で、起動ログの `MTP_SLOTS` に出る。
+  1 回の verify forward に融合するのは 4 request / 32 行までで、超える分は同じ round 内で
+  複数回の forward に分かれる。
 - partial accept は GDN の compact log replay で復元する。target の再 forward は行わない。
 - prefix cache は MTP 経路では使わない。
 - grouped expert（MoE）checkpoint でも MTP block は load / 実行され、`--mtp` の生成列は

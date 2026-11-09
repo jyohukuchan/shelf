@@ -159,10 +159,13 @@ request 1 個あたりの生成予算（推論予算）は `--inference-budget-t
 `--mtp` を指定すると、checkpoint の MTP block（`mtp.*`）を drafter として使う。
 `--dflash2-model-dir` とは排他的である。
 
-- server の MTP は **1 request ずつ直列**に処理する。`--max-concurrent-requests` を
-  2 以上にしても、生成中の request が完了するまで次を開始しない。
-- tool calling / sampling / cancel は MTP 経路でも利用できる。ただし生成中の
-  cancel はその request が終わるまで反映されない。
+- server の MTP は複数 request を同時に処理する（継続バッチ）。同時に保持する数は
+  `--max-concurrent-requests` と verify の行容量（`max_batch_rows / (--mtp-drafts + 1)`）の
+  小さい方で、起動ログの `MTP_SLOTS` に出る。1 回の verify forward に融合するのは
+  4 request / 32 行までで、超える分は round 内で複数回の forward に分かれる。
+  実装は [../developer/mtp.md](../developer/mtp.md) の「serve-stdio」を参照。
+- tool calling / sampling / cancel は MTP 経路でも利用できる。cancel は次の round の
+  境界で反映される。
 - 思考 budget（`reasoning_budget_tokens`）は MTP では無視し、通常の生成を行う。
 - `--mtp-drafts` は 4 前後が目安。大きすぎると verify の固定費が増える。
 
