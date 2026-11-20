@@ -1,8 +1,8 @@
 #include <shelf/models/hy4_flash/decoder.h>
+#include <shelf/models/hy4_flash/routes.h>
 #include <shelf/kernels/optimized/linear/exl3_family/mul24/decode.h>
 #include <algorithm>
 #include <cstring>
-#include <numeric>
 
 namespace shelf::hy4 {
 namespace {
@@ -95,17 +95,10 @@ Mat moe(Ops &op, int layer, Mat x) {
     checked(hipGetLastError());
     std::vector<Hy4Route> host(size_t(x.rows) * 16);
     op.copy(host.data(), picks, host.size() * sizeof(Hy4Route), hipMemcpyDeviceToHost);
-    std::array<std::vector<Hy4Route>, 3> routes;
-    std::array<std::vector<int>, 3> offsets;
-    for (int row = 0; row < x.rows; ++row) {
-        for (int r = 0; r < 3; ++r)
-            offsets[r].push_back(routes[r].size());
-        auto first = host.begin() + row * 16;
-        std::sort(first, first + 16, [](const auto &a, const auto &b) { return a.expert < b.expert; });
-        for (auto it = first; it != first + 16; ++it)
-            routes[op.gpu.model.owners[layer - 1][it->expert]].push_back(*it);
-    }
-    std::array<Mat, 3> result{};
+    std::array<std::vector<Hy4Route>, 4> routes;
+    std::array<std::vector<int>, 4> offsets;
+    partition_routes(host, x.rows, op.gpu.model.owners[layer - 1], 3, routes, offsets);
+    std::array<Mat, 4> result{};
     for (int r : {1, 2, 0}) {
         if (routes[r].empty())
             continue;
