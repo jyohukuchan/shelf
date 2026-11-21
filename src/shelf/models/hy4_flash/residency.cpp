@@ -194,6 +194,11 @@ void Residency::upload_experts(int r, int layer) {
 }
 void Residency::upload() {
     auto profile = std::getenv("SHELF_HY4_PROFILE_EP");
+    auto transport = std::getenv("SHELF_HY4_EP_TRANSPORT");
+    const std::string_view mode = transport ? transport : "";
+    if (!mode.empty() && mode != "push" && mode != "peer" && mode != "host")
+        throw std::invalid_argument("不正な EP 転送方式です");
+    push = mode.empty() || mode == "push";
     for (int dst = 0; dst < 3; ++dst)
         for (int src = 0; src < 3; ++src) {
             if (src == dst || (dst && src))
@@ -201,21 +206,31 @@ void Residency::upload() {
             int accessible = 0;
             check(hipSetDevice(physical[dst]));
             check(hipDeviceCanAccessPeer(&accessible, physical[dst], physical[src]));
-            if (accessible) {
+            if (accessible && mode != "host") {
                 auto status = hipDeviceEnablePeerAccess(physical[src], 0);
                 peer[dst][src] = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
                 owns_peer[dst][src] = status == hipSuccess;
                 if (status != hipSuccess)
                     (void)hipGetLastError();
             }
-            if (peer[dst][src]) {
-                check(hipSetDevice(physical[src]));
-                check(
-                    hipEventCreateWithFlags(&ready[src][dst], hipEventDisableTiming | hipEventReleaseToSystem));
+        }
+    for (int dst = 0; dst < 3; ++dst)
+        for (int src = 0; src < 3; ++src) {
+            if (src == dst || (dst && src))
+                continue;
+            bool available = push ? peer[src][dst] : peer[dst][src];
+            if (available) {
+                for (int q = 0; q < 2; ++q) {
+                    check(hipSetDevice(physical[src]));
+                    check(hipEventCreateWithFlags(&ready[src][dst][q], hipEventDisableTiming | hipEventReleaseToSystem));
+                    check(hipSetDevice(physical[dst]));
+                    check(hipEventCreateWithFlags(&ack[dst][src][q], hipEventDisableTiming));
+                }
             }
-            if (!peer[dst][src] && !staging)
+            if (!available && !staging)
                 check(hipHostMalloc(&staging, max_prefill_chunk * 1536u * 2u, hipHostMallocPortable));
-            fprintf(stderr, "transfer=%d->%d method=%s\n", src, dst, peer[dst][src] ? "peer" : "host");
+            fprintf(stderr, "transfer=%d->%d method=%s\n", src, dst,
+                    available ? (push ? "push" : "peer") : "host");
         }
     const auto begin = std::chrono::steady_clock::now();
 #ifdef SHELF_HY4_RDMA
@@ -335,12 +350,26 @@ void Residency::transfer(void *dst, int destination, const void *src, int source
     std::chrono::steady_clock::time_point begin;
     if (expert_begin[0])
         begin = std::chrono::steady_clock::now();
-    if (peer[destination][source]) {
-        check(hipSetDevice(physical[source]));
-        check(hipEventRecord(ready[source][destination], nullptr));
-        check(hipSetDevice(physical[destination]));
-        check(hipStreamWaitEvent(nullptr, ready[source][destination], 0));
-        check(hipMemcpyPeerAsync(dst, physical[destination], src, physical[source], bytes, nullptr));
+    if (push ? peer[source][destination] : peer[destination][source]) {
+        int p = parity[source][destination];
+        parity[source][destination] ^= 1;
+        auto ready_event = ready[source][destination][p];
+        if (push) {
+            check(hipSetDevice(physical[destination]));
+            check(hipEventRecord(ack[destination][source][p], nullptr));
+            check(hipSetDevice(physical[source]));
+            check(hipStreamWaitEvent(nullptr, ack[destination][source][p], 0));
+            peer_copy(dst, src, bytes);
+            check(hipEventRecord(ready_event, nullptr));
+            check(hipSetDevice(physical[destination]));
+            check(hipStreamWaitEvent(nullptr, ready_event, 0));
+        } else {
+            check(hipSetDevice(physical[source]));
+            check(hipEventRecord(ready_event, nullptr));
+            check(hipSetDevice(physical[destination]));
+            check(hipStreamWaitEvent(nullptr, ready_event, 0));
+            check(hipMemcpyPeerAsync(dst, physical[destination], src, physical[source], bytes, nullptr));
+        }
     } else {
         if (!staging || bytes > max_prefill_chunk * 1536u * 2u)
             throw std::runtime_error("転送作業域の範囲外です");
@@ -392,14 +421,17 @@ void Residency::shutdown() {
             collect(hipHostFree(route_host[r]));
             route_host[r] = nullptr;
         }
-        for (auto &event : ready[r])
-            if (event) {
-                auto status = hipSetDevice(physical[r]);
-                collect(status);
-                if (status == hipSuccess)
-                    collect(hipEventDestroy(event));
-                event = nullptr;
-            }
+        for (auto *events : {&ready, &ack})
+            for (auto &pair : (*events)[r])
+                for (auto &event : pair)
+                    if (event) {
+                        auto status = hipSetDevice(physical[r]);
+                        collect(status);
+                        if (status == hipSuccess)
+                            collect(hipEventDestroy(event));
+                        event = nullptr;
+                    }
+
     }
     if (staging) {
         collect(hipHostFree(staging));
