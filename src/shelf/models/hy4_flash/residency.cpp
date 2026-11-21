@@ -55,6 +55,9 @@ Residency::~Residency() noexcept {
     }
 }
 void Residency::reserve() {
+    auto vmm = std::getenv("SHELF_ARENA_VMM");
+    if (vmm && std::string_view(vmm) == "1")
+        throw std::runtime_error("Hy4 の複数 GPU 実行では SHELF_ARENA_VMM=1 を使用できません");
     int count = 0;
     check(hipGetDeviceCount(&count));
     if (count != 3)
