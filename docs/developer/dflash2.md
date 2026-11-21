@@ -209,11 +209,10 @@ weight を掛ける。
   - FP8 K128N128: `launch_activation_quantize_fp8_finegrained`（活性は行ごとの
     `peak/448` scale、累算 F32）で activation を e4m3 へ量子化し、block-scaled
     W8A8 WMMA GEMM で F32 logits を作る。
-  - EXL3: mul1 は W16A16 kernel、mul24 は activation の回転・INT8 量子化、
-    INT8 GEMM、出力回転の順に実行する。両形式は codebook と trellis の配置が異なる。
-    mul24 のみ INT8 GEMM の F32 累加 buffer `exl3_lm_head_accum`
+  - EXL3（mul24）: activation の回転・INT8 量子化、INT8 GEMM、出力回転の順に実行する。
+    INT8 GEMM の F32 累加 buffer `exl3_lm_head_accum`
     （`[max_rows, vocab_size]` F32）を `create_dflash2_executor` で確保する。
-    BF16 / FP8 / EXL3 mul1 では確保しない。
+    BF16 / FP8 では確保しない。
 - proposal logits は **F32** で出す（bf16 へ落とさない。top-16 ordering が proposal に
   直結するため）。
 - `create_dflash2_spec_decoder()` が target との shape 一致
@@ -226,9 +225,9 @@ TP>1 では target head を rank ごとの語彙 shard に分割し、drafter �
 - `DFlash2TpProposal` が `DFlash2ProposalDistributor` を実装する。rank 0 が final
   hidden を各 rank に peer store し、各 rank が自分の語彙 shard の logits・局所 top-k・
   行 logsumexp を計算する。rank 0 が候補と分母を merge して selector に渡す。
-- 対応する head encoding は Int8W32 と EXL3。EXL3 mul1 は W16A16 GEMM、mul24 は
-  activation の回転・INT8 量子化・INT8 GEMM・出力回転で計算する。mul24 のみ rank
-  ごとに activation workspace と `[max_rows, local_vocab]` F32 accum を確保する。
+- 対応する head encoding は Int8W32 と EXL3（mul24）。EXL3 は activation の回転・
+  INT8 量子化・INT8 GEMM・出力回転で計算し、rank ごとに activation workspace と
+  `[max_rows, local_vocab]` F32 accum を確保する。
 - `create_proposal_shard_buffers()` は head から必要な workspace を決める。
 - 使用する語彙 shard は target head の `partition`（axis 0）から決まる。
 
@@ -856,7 +855,8 @@ target verify の GDN recurrence 本体:
   行ごとに `recurrent_history` と compact log を保存し、`row_parent` が示す
   分岐行は history から親 state を復元する。
 - `WmmaVerify` は lossy / exact の両 decomposition を持ち、切替は
-  `SHELF_GDN_RECURRENCE_EXACT` / `SHELF_GDN_RECURRENCE_LOSSY` に従う。
+  `SHELF_GDN_RECURRENCE_EXACT` で行う。未設定または `0` が lossy（既定）、
+  それ以外が exact。`SHELF_GDN_RECURRENCE_LOSSY` は使用しない。
 - decode / prefill は `Wmma` / `F32` の通常選択のままである。
 - batch に verify と decode/prefill が混在する場合、executor 内部で
   verify region（`execution_class == SPEC_VERIFY`）とそれ以外へ分け、
@@ -973,12 +973,12 @@ samples を別途 D2H する。
   選択候補の外にある確率の平均は `DFLASH2_TREE_RESIDUAL_MASS` に出力する。
   採用した経路の KV と target tap は連続位置に集め、GDN state は受理経路から確定する。
   浮動小数点の累算順序の差により非投機生成との完全一致は保証しない。
-  既定の `auto` は draft 数 7・TP=1 で、その round の生成中 request が
-  1 本だけで投機中なら 10 行、それ以外は chain の 8 行を使う。通常 decode 中や
-  policy により投機を停止中の request も数え、prefill 中と待機中は数えない。auto では
-  stochastic request を投機せず通常 decode する。単発の greedy
+  省略時は 0 で chain verify を使う。明示的な `auto` は draft 数 7・TP=1 で、
+  その round の生成中 request が 1 本だけで投機中なら 10 行、それ以外は chain の 8 行を使う。
+  通常 decode 中や policy により投機を停止中の request も数え、prefill 中と待機中は数えない。
+  auto では stochastic request を投機せず通常 decode する。単発の greedy
   生成でも 10 行を使う。明示的な整数指定は同時数に依存しない。
-  他の draft 数や TP では tree budget 省略時に chain を使う（server は警告する）。
+  他の draft 数や TP で `auto` を指定した場合は chain を使い、server は警告する。
 - `--dflash2-max-sessions N`: serve で同時に投機を行う request 数（default
   `min(--max-concurrent-requests, 8)`）。session pool の容量、batch verify の行数
   （`N × session ごとの verify 行数上限`）、drafter scratch の大きさがこの値で決まる。
@@ -1065,8 +1065,8 @@ serve の既定（`max_concurrent_requests × block_size`）ではこの値が�
 `max_concurrent_requests` を上げると drafter の logits buffer も増える。
 
 `dflash2_draft_scratch_bytes` / `dflash2_footprint` は target lm_head の形式
-（`exl3_mul24_head`）を受け取り、mul24 のときだけ `exl3_lm_head_accum` 分の
-logits buffer を 1 つ加算する。BF16 / FP8 / EXL3 mul1 では `proposal_logits`
+（`exl3_mul24_head`）を受け取り、EXL3（mul24）のときだけ `exl3_lm_head_accum` 分の
+logits buffer を 1 つ加算する。BF16 / FP8 では `proposal_logits`
 1 つ分のみである。呼び出し側は target の `lm_head` の `quant_spec` から
 `exl3_mul24_head` を導く（TP では drafter が実際に借りる head、すなわち
 Qwen4Exp の `weights().lm_head` か rank 0 の `private_lm_head()`）。
@@ -1232,12 +1232,41 @@ verify の受理結果は残り token 数と停止 token の最初の位置で�
 target と DFlash2 context の状態を確定する。停止 token 自体は出力し、その後の行は確定しない。round の入力 `pending_token` が停止 token の場合は、
 step の先頭で何も draft せず `finished=true`（出力 0 個）を返す。
 
-### 構造化出力との接続状況
+### 構造化出力との併用
 
-verify sampler は request ごとに連続した行別 token bitmask を扱えるが、
-DFlash2 の draft / verify 間で server と mask を交換する処理は未実装である。
-構造化出力付き request は DFlash2 / MTP を使用せず通常 decode にフォールバックする。
-実装上の残作業は [接続案](../research/20261111/structured_output_speculative_design.md) を参照。
+DFlash2 有効時の構造化出力付き request は通常 decode へ退避せず、draft と verify の
+間で server と行別 bitmask を 1 往復交換する 2 phase round で動作する（MTP は引き続き
+通常 decode へフォールバックする）。
+
+- **prefill**: `dflash2_spec_prefill` の最終 chunk に初期 `token_bitmask` を適用する
+  （reasoning 遅延 grammar 中は適用しない）。
+- **Phase A（draft）**: `dflash2_spec_propose_slot` で最大 `K` 個の draft token を生成し、
+  `draft_round_id` を進めて mask 待ち状態（`DraftMaskState::PendingMask`）へ移す。
+  stdio server は `{"event":"draft","request_id":...,"round_id":...,"draft_tokens":[...]}`
+  を送信する。
+- **server 応答（`draft_masks`）**: server は `draft_tokens` を先頭から grammar で検証し、
+  受理可能な先頭長 `valid_prefix` と `valid_prefix + 1` 行分の bitmask を
+  `{"op":"draft_masks","request_id":...,"round_id":...,"valid_prefix":...,"bitmasks":[...]}`
+  で返す。stdio server は `valid_prefix` を超える行を全許可（`0xffffffff`）で埋めた
+  固定 `K + 1` 行の device buffer を用意し、`DraftMaskState::Ready` へ進める。
+- **Phase B（verify）**: `dflash2_spec_step_batch` は事前生成済み draft
+  （`precomputed_drafts`）と行別 bitmask（`token_bitmask` / `token_bitmask_row_stride_words`）
+  を使って固定 `K + 1` 行の verify を実行し、受理 draft 数の上限を
+  `max_accept_drafts = valid_prefix` で制限する（`valid_prefix == 0` のときは row 0 の
+  correction token のみを採用する）。
+- **reasoning 遅延 grammar**: thinking 中（`grammar_delayed == true`）は server との
+  mask 往復を行わず通常どおり DFlash2 を実行する。`stop_after_token` に close token を
+  設定し、自然な出力または thinking 予算による強制置換で close token を検出した位置で
+  出力と commit（GDN / KV / DFlash2 context）を切り詰め、次 round から grammar を有効化する。
+- **`need_mask` 抑止**: DFlash2 の構造化出力経路で出力する `token` event には
+  `"need_mask": false` を付与する。server は `grammar.accept(token)` で状態のみを進め、
+  不要な単一行 `mask` コマンドを送らない。
+- **HIP graph と高速経路**: bitmask 付き verify（greedy・8 / 10 行）は executor の固定
+  device bitmask staging（`graph_token_bitmask_staging`）と `has_token_bitmask` 付きの
+  graph cache key により HIP graph capture / replay に対応する（[sampling.md](sampling.md)）。
+  制約付き slot では tree verify・device token bridge・`--dflash2-adaptive` による通常 decode
+  への切り替えを無効化する一方、非制約 batch は既存の device token bridge + HIP graph
+  高速経路を維持する。
 
 ### 投機の適応制御（実験段階）
 

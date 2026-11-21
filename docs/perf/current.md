@@ -46,7 +46,7 @@ prefill は BetterBench がリクエストごとに入力 token 数を TTFT で�
 **現在の build に対する qualified baseline は、2026-11-03 の long-context prefill、
 2026-11-05 の MTP decode（Qwen3.8-27B MXFP4）・MoE decode / prefill / quality・
 MoE MTP decode（Qwen3.6-35B-A3B MXFP4）・MoE tensor parallel prefill（Qwen3.6-35B-A3B MXFP4）・
-MoE pipeline parallel（Qwen3.6-35B-A3B MXFP4）、EXL3 W16A16 decode / prefill、
+MoE pipeline parallel（Qwen3.6-35B-A3B MXFP4）、
 2026-11-04 の 9B BF16 linear allowlist である。**
 2026-11-06 の model load（Flash Next MXFP4 TP4 / 27B FP8 TP2）と、同じ日の
 BF16 GEMM / TP copy（Flash Next MXFP4 TP4）は reference run として下の節に記録する。
@@ -84,6 +84,157 @@ date・build・GPU 割り当て・生成結果の一致アンカーとともに�
 | カテゴリ別 serving | `vendor/BetterBench`（methodology §9） | decode t/s、TTFT p50 |
 | fp8 KV の数値品質 | `tools/quality_gate.py` / `shelf-bench quality` | ppl 差、mean KL、top-1 一致率 |
 
+## 2026-11-19 27B MXFP4 decode の context 依存と server 同時数
+
+`models/Qwen3.8-27B-Quark-AWQ-MXFP4`、R9700 1 枚、bf16 KV、greedy の decode。
+context 依存は `shelf-bench tg --context <N> --tokens 64 --prefill-chunk 4096`、
+server は `shelf-server --device 2 --max-concurrent-requests 4 --max-seq-len 4096
+--prefill-chunk 4096` に prose 519 token・64 token 生成の streaming 要求を
+同時数分だけ並べた client 計測である。
+
+- measurement revision: `961fc78`
+- GPU: Radeon AI PRO R9700 × 1（`--device 2`、sclk 未固定）
+
+| context | per token | tok/s | 512 からの増分 |
+| ---: | ---: | ---: | ---: |
+| 512 | 30.5 ms | 32.8 | — |
+| 8,192 | 31.9 ms | 31.4 | +1.4 ms |
+| 16,384 | 33.5 ms | 29.9 | +3.0 ms |
+| 32,768 | 36.7 ms | 27.3 | +6.2 ms |
+
+32,768 では paged attention（split + reduce）が 6.29 ms/token（17 %）を占め、
+KV 2.15 GB/token を実効 342 GB/s で読む。内訳と棄却した案は
+[../research/20261119/decode_server_gap_long_context.md](../research/20261119/decode_server_gap_long_context.md)
+に置く。
+
+| 同時 stream | aggregate | per-stream |
+| ---: | ---: | ---: |
+| 1 | 28.6 tok/s | 32.8 tok/s |
+| 2 | 57.9 tok/s | 30.1 tok/s |
+| 4 | 102.6 tok/s | 27.1 tok/s |
+
+単一 stream の inter-token は server 経路でも 30.0 ms で、bench と一致する。
+host の折り返しは約 50 us、`hipGraphLaunch` は 11〜29 us であり、
+kernel 合計 28.5 ms との差 1.9 ms は GPU 側の直列化である。
+
+## 2026-11-19 27B MXFP4 prefill chunk 4096 と GDN f32 state
+
+GDN recurrent state を fp16 から f32 にし、prefill chunk を 2048 から 4096 に
+変えても multi-chunk が single-chunk と一致するようにした。f32 state の経緯は
+[../research/20261119/prefill_chunk_quality.md](../research/20261119/prefill_chunk_quality.md)。
+
+- measurement revision: worktree `perf/qwen38-prefill`、commit `79fba00`、2026-11-19
+- GPU: Radeon AI PRO R9700 × 1（`--device 1`）、bf16 KV
+- command: `shelf-bench pp --model-dir models/Qwen3.8-27B-Quark-AWQ-MXFP4 --device 1
+  --prompt-tokens 8192 --prefill-chunk <2048|4096> --kv-cache-dtype bf16 --warmup 1`
+
+| prefill-chunk | prefill p50 | tokens/s |
+| ---: | ---: | ---: |
+| 2048 | 3,946.0 ms | 2,076 |
+| 4096 | 3,792.0 ms | 2,160 |
+
+`--prefill-chunk 4096` で **3.9% 短縮**。MXFP4 producer の norm/residual 入力を
+16B ベクトル化した後の最終値は 3,780.5 ms（2 run p50）。
+ベクトル化単体の A/B は scalar 3,766.1 / 3,772.3 / 3,781.9 ms に対し
+vector 3,757.3 / 3,763.5 / 3,768.4 ms で約 0.3% 短縮（3 ペア、KL 0）。
+
+品質（`shelf-bench quality`、context 8,192、256 positions、bf16 KV、
+4×2048 と 2×4096 の比較）: **KL mean 0、top-1 一致 100%**。
+context 2,048 / 4,096 でも同様に KL 0。
+
+decode への影響（`shelf-bench tg --mode forward --context 512 --tokens 128`）:
+f32 state 32.41 tok/s、fp16 state 32.82 tok/s で約 1.25% 低下
+（state traffic 56.6 → 113 MB/token）。prefill の品質修正と引き換えに許容する。
+
+GDN recurrence 単体（`shelf-bench gdn-recurrence --key-heads 8 --value-heads 48
+--head-k 128 --head-v 128 --nreq 1`）: rows 2,048 1.75 ms/layer、rows 4,096
+2.08 ms/layer。36 層で約 75 ms、prefill 全体の約 4%。
+
+## 2026-11-19 Qwen3.8-Flash-Next MXFP4 単一リクエスト decode の chunk 非依存化
+
+`--moe-host-experts 448` の TP=1 単一リクエストで、`--prefill-chunk` によらず decode が
+22.3〜23.0 tok/s になるよう expert cache の再配置スケジュールを修正した。修正前は
+chunk が大きいほど再配置計画の消化が decode に持ち越され、14.3 tok/s まで落ちていた。
+経緯と切り分けは
+[../research/20261119/moe_cache_chunk_dependent_decode.md](../research/20261119/moe_cache_chunk_dependent_decode.md)。
+
+- measurement revision: 2026-11-19 の working tree（expert cache の batch step 全数消化を含む）
+- GPU: Radeon AI PRO R9700 × 1（`--device 0`）
+- command: `shelf-compute --model-dir models/Qwen3.8-Flash-Next-Quark-MXFP4 --device 0
+  --moe-host-experts 448 --prefill-chunk <512|1024|2048|4096> --input-ids-file
+  <同一 token 4096 個> --max-new-tokens 64 --max-seq-len 8192 --kv-cache-dtype octave:c5v5`
+
+| prefill-chunk | 修正前 decode | 修正後 decode | 修正後 prefill |
+| ---: | ---: | ---: | ---: |
+| 512 | 22.18 tok/s | 22.30 tok/s | 10,268.5 ms |
+| 1024 | 16.41 tok/s | 22.53 tok/s | 7,652.6 ms |
+| 2048 | 14.52 tok/s | 22.56 tok/s | 5,707.2 ms |
+| 4096 | 14.30 tok/s | 23.04 tok/s | 5,103.4 ms |
+
+- 修正後の prefill は再配置の一括コストを含む。同一 session の chunk 4096 は修正前
+  3,564.9 ms → 修正後 5,103.4 ms で、増分は decode が担っていた約 2,474 交換
+  （PCIe 往復約 12 GiB）の移動である。E2E 合計は 7,805 ms → 7,621 ms。
+- `GENERATED_IDS` は修正前後で bitwise 一致する。prompt が同一 token の繰り返しのため
+  受理率などの実運用分布ではない。
+- prefill の絶対値は page cache の状態で変わるため、run 間の相対比較にのみ使う。
+## 2026-11-19 Qwen3.8-27B MXFP4 non-spec prefill / decode
+
+`models/Qwen3.8-27B-Quark-AWQ-MXFP4` の非投機 prefill と decode で、
+MXFP4 活性の量子化を producer kernel に融合した構成の測定である。
+融合の内容と棄却した候補は
+[../research/20261119/mxfp4_activation_producer.md](../research/20261119/mxfp4_activation_producer.md)
+に置く。
+
+- measurement revision: `db09503`
+- GPU: Radeon AI PRO R9700 × 1（`--device 1`、bf16 KV）
+- command:
+  `shelf-bench pp --model-dir models/Qwen3.8-27B-Quark-AWQ-MXFP4 --device 1
+  --prompt-tokens 2048 --prefill-chunk 2048 --kv-cache-dtype bf16 --warmup 1 --runs 3`
+  と `shelf-bench tg --mode greedy --model-dir models/Qwen3.8-27B-Quark-AWQ-MXFP4
+  --device 1 --context 512 --tokens 128 --prefill-chunk 512 --kv-cache-dtype bf16
+  --warmup 1`
+- `SHELF_DISABLE_MXFP4_PRODUCER` の on / off を交互に 3 回ずつ実行した p50。
+  sclk は固定していない
+
+| 断面 | 分離（off） | 融合（on） | 差 |
+| --- | ---: | ---: | ---: |
+| prefill 2048 | 937.8 ms（2,229 tok/s） | **906.2 ms（2,260 tok/s）** | −3.4 % |
+| non-spec decode ctx512 / 128 token | 31.72 tok/s | **32.87 tok/s** | +3.6 % |
+
+- 量子化単体の thread 数を rows <= 32 で 1024 にした変更（`1e9948f`）は、
+  decode 30.64 → 31.7 tok/s（+3.5 %）だった。上の fused 構成はこの変更を含む。
+- 単一リクエスト E2E（prose 512 token、16 token 生成、`shelf-compute`）は
+  30.86 → 32.02 tok/s で、`GENERATED_IDS` は一致した。
+- profile 上の decode は 30.24 → 28.5 ms/token、launch は 1653 → 1165 になった。
+
+## 2026-11-19 Qwen3.8-Flash-Next MXFP4 TP=2 prefill
+
+TP=2 で `LINEAR_BF16` の `(out_features 3072, k 2560)` が allowlist から漏れ、
+36 GDN 層が correctness interpreter に落ちていた。allowlist と MXFP4 の spill を
+修正した後の測定である。経緯は
+[../research/20261119/mxfp4_tp2_prefill_fallback_and_spills.md](../research/20261119/mxfp4_tp2_prefill_fallback_and_spills.md)
+に置く。
+
+- measurement revision: 2026-11-19 の working tree
+- GPU: Radeon AI PRO R9700 × 2（device 2,3）
+- command: `shelf-bench pp --model-dir models/Qwen3.8-Flash-Next-Quark-MXFP4
+  --device 2,3 --tensor-parallel 2 --moe-host-experts 224 --prompt-tokens 4096
+  --prefill-chunk 4096 --kv-cache-dtype octave:c5v5 --tokens-file <4096 token>
+  --warmup 1 --runs 3`
+
+| 構成 | prefill p50 |
+| --- | ---: |
+| TP=2（device 2,3、host 224） | **1,447.4 ms**（2,829.9 tok/s） |
+| TP=1（device 1、host 448） | 2,389.5 ms（1,714.2 tok/s） |
+
+- TP=2 の 3 run は 1,722.8 / 1,447.4 / 1,277.3 ms で、run ごとに短くなる。TP=1 は
+  2,399.4 / 2,389.5 / 2,389.5 ms で安定している。
+- 修正前の TP=2 は 12.65 s（device 2,3）／12.84 s（device 0,2）だった。kernel trace では
+  `model_dispatch_kernel` が 1 dispatch 約 310 ms × 36 層 × 2 rank を占めていた。
+- 参考: `models/Qwen3.8-27B-Quark-AWQ-MXFP4` の prefill 256 token は
+  MXFP4 non-fold kernel の spill 修正で 169.8/170.8 ms → 156.8/157.0 ms（−7.7 %）。
+  2048 token は 934.3/937.0 ms → 935.3 ms で変化しない。
+
 ## 2026-11-18 Qwen3.8-Flash-Next MXFP4 host offload decode
 
 `models/Qwen3.8-Flash-Next-Quark-MXFP4`（48 層・hidden 2560・experts 512・top_k 10・
@@ -115,6 +266,34 @@ miss expert の重みは host の pinned plane から GPU が PCIe 越しに読�
 約 25 GB/s で、VRAM の約 1/25 である。routing の偏りと上限の測定は
 [../research/20261118/moe_expert_offload.md](../research/20261118/moe_expert_offload.md)
 に置く。
+
+## 2026-11-19 Qwen3.8-Flash-Next MXFP4 DFlash2 decode
+
+`models/Qwen3.8-Flash-Next-Quark-MXFP4` に `models/Qwen3.8-Flash-Next-DFlash2` を
+drafter として付け、単一リクエストで decode を測った。prompt は同一 token（id=1）を
+4096 個並べたもので、受理率は実運用より高く出る。
+
+- measurement revision: 2026-11-19 の working tree（TP=2 prefill 修正 `dccef70` を含む）
+- GPU: Radeon AI PRO R9700（TP=1 は 1 枚、TP=2 は 2 枚 device 2,3）
+- command: `shelf-compute --input-ids-file <4096 token> --max-new-tokens 64
+  --max-seq-len 8192 --max-num-batched-tokens 4096 --kv-cache-dtype octave:c5v5
+  --dflash2-model-dir models/Qwen3.8-Flash-Next-DFlash2 --dflash2-drafts 6
+  --dflash2-tree-budget 0`
+- `--moe-host-experts` は TP=1 で 448、TP=2 で 224
+
+| 構成 | prefill | decode | verify / round | 受理（平均 / full） |
+| --- | ---: | ---: | ---: | --- |
+| TP=1 | 4.88 s | 28.5 tok/s（35.1 ms/token） | 175 ms | 4.18 / 0.636 |
+| TP=2 | 4.01 s | 37.3 tok/s（26.8 ms/token） | 100 ms | 3.14 / 0.500 |
+
+- TP=2 の prefill は BF16 allowlist と MXFP4 spill の修正で 12.6 s から短縮した
+  （[TP=2 prefill の節](#2026-11-19-qwen38-flash-next-mxfp4-tp2-prefill)）。
+- TP=1 の decode は 11-18 ツリーの測定（21.5 ms/token、受理 5.33）から後退している。
+  同じ prompt・config で verify が 129 → 175 ms/round、受理も低下しており、
+  decode 経路のカーネル選択か数値の変化が疑わしい（未解決）。
+- `shelf-bench tg` は DFlash2 の drafter を読み込まないため、DFlash2 の測定は
+  `shelf-compute` の単一リクエスト経路で行う。tg の spec なし per-token は
+  `--context 3072 --tokens 128 --moe-host-experts 384` で 37.7 ms。
 
 ## 2026-11-18 Qwen3.8-27B MXFP4 decode GEMV
 
@@ -1034,7 +1213,7 @@ shared expert の寄与が落ちていた**（原因と修正は
 
 `models/Qwen3.6-35B-A3B-Quark-AWQ-MXFP4`（40 層・experts 256・top_k 8・moe_intermediate 512・
 shared 512）を TP=2 / device 0,1 で測った。分割方針と契約は
-[../developer/tensor_parallel_execution.md](../developer/tensor_parallel_execution.md) §11-1、
+[../developer/multi-gpu.md](../developer/multi-gpu.md)、
 expert 軸を選んだ理由・数値破綻の経過・allowlist 登録の内訳は
 [../research/20261105/moe_tp_expert_axis.md](../research/20261105/moe_tp_expert_axis.md) §6 / §7。
 
@@ -1114,7 +1293,7 @@ corpus は `vendor/BetterBench/corpus/v1` を `tools/quality_gate.py corpus` し
 
 `models/Qwen3.6-35B-A3B-Quark-AWQ-MXFP4`（40 層・experts 256・top_k 8）を device 0,1 の
 PP=2（stage `[0,20)` / `[20,40)`）で測った。分割契約と stage model の interface は
-[../developer/pipeline_parallel.md](../developer/pipeline_parallel.md) §2、
+[../developer/multi-gpu.md](../developer/multi-gpu.md)、
 実装の経過と採否は
 [../research/20261105/moe_pipeline_parallel.md](../research/20261105/moe_pipeline_parallel.md)。
 
@@ -1178,9 +1357,82 @@ in-memory 量子化（1,048,576 行、入力 1 GiB）:
   ほぼなくなった。page cache の状態を制御した benchmark ではない。
 - mmap 経路は BF16 95.37 GiB が page cache に載り得る。streaming 経路は処理済み範囲を
   `madvise` / `posix_fadvise(DONTNEED)` で落とし、peak RSS を約 39.2 GiB に抑える。
-  `SHELF_PLE_STREAM_IO=pread|mmap|direct` で切り替え、既定は mmap window。wall は
+  `--ple-stream-io pread|mmap|direct` で切り替え、既定は mmap window。wall は
   disk 帯域で決まり、方式差は 1 s 未満だった（mmap / O_DIRECT は各 1 回）。
 - full model load、GPU 実行、生成品質はこの計測に含まない。
+
+## 2026-11-18 PLE INT6 artifact cache
+
+- model: `models/Qwen3.8-Flash-Next-Quark-MXFP4` の PLE n-gram table
+- artifact: `<model_dir>/quanted_ple.bin`、41,600,684,376 B（38.743 GiB）
+- command: `./build/tests/test_qwen4exp_load --skip-gpu --model-dir models/Qwen3.8-Flash-Next-Quark-MXFP4`
+- CPU: Ryzen 7 7800X3D、16 thread
+
+| 状態 | wall | user | sys | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 初回（量子化 + artifact 書き込み） | 52.08 s | 21.6 s | 31.4 s | 未測定 |
+| 2 回目（artifact 読み込み） | **15.04 s** | **0.67 s** | 20.68 s | **38.93 GiB** |
+
+- artifact は source shard の size / mtime fingerprint で検証し、stale なら再量子化する。
+- 初回は temp file へ書き、8 shard ごとに `fdatasync` してから `rename` する。
+- `--ple-artifact 0` で artifact を無効にできる。
+- full model load、GPU 実行、生成品質はこの計測に含まない。
+
+## 2026-11-20 PLE tiered cache
+
+- model: `models/Qwen3.8-Flash-Next-Quark-MXFP4` の PLE n-gram table
+- load command: `./build/tests/test_qwen4exp_load --skip-gpu --model-dir models/Qwen3.8-Flash-Next-Quark-MXFP4`
+- serve command: `./build/shelf-compute --model-dir models/Qwen3.8-Flash-Next-Quark-MXFP4 --input-ids-file <1024 ids> --max-new-tokens 1 --max-num-batched-tokens 4096 --prefill-chunk 512 --moe-host-experts 448 --max-concurrent-requests 2 --max-seq-len 262144 --kv-cache-dtype octave:c5v5`
+- CPU: Ryzen 7 7800X3D、16 thread。GPU: R9700（gfx1201）。page cache は warm。
+
+| 構成 | PLE host | load wall | peak RSS | prefill 1024 tokens |
+| --- | ---: | ---: | ---: | ---: |
+| full resident | 38.74 GiB | 13.91 s | 38.95 GiB | 4713.9 ms |
+| tiered 1 GiB | 1.00 GiB | **2.85 s** | **1.21 GiB** | 4790.6 ms |
+
+- Hot ブロックは 2048 行（260 KiB）。8192 行ごとに頻度で入れ替え、1 回の更新で
+  最大 64 ブロック（16 MiB）を O_DIRECT + pread で pinned host へ読み込む。
+  Cold 側は mmap のページキャッシュから読む。
+- 1024 token prefill の Hot ヒット率はキャッシュ比率（約 2.6%）に近く、
+  prefill 時間の差は 1.6% だった。load と RSS の改善が主な効果である。
+- 両構成で `GENERATED_IDS=24`（sha1 `4d134bc072212ace2df385dae143139da74ec0ef`）が一致した。
+- 各値は 1 回の測定。cold page cache と Hot キャッシュの学習途中は含めない。
+
+EXL3-INT8 3.05bpw モデル（`models/kusuriya-labs/Qwen3.8-Flash-Next-EXL3-INT8-3.05bpw`）
+でも同じ CLI が有効。PLE は K=5 の trellis（行 102 バイト）で、shard offset が
+4 KiB 境界にないため、Hot ブロックは境界まで整列読みしてからコピーする。
+
+| 構成 | PLE host | load wall | peak RSS |
+| --- | ---: | ---: | ---: |
+| full resident | 30.40 GiB | 13.29 s | 30.56 GiB |
+| tiered 1 GiB | 1.00 GiB | **2.34 s** | **1.17 GiB** |
+
+- 同一入力で full / tiered ともに `GENERATED_IDS=24` が一致した。
+
+## 2026-11-20 Qwen4Exp QSA block-sparse（q_per_kv=12）
+
+Qwen4Exp の QSA 層（`q_per_kv = 12`）を block-sparse kernel の対象にした前後比較。
+修正前は mask 付き paged attention にフォールバックしていた。
+
+- measurement revision: 作業ツリー（HEAD `2053b63` + QSA `q_per_kv = 12` 対応）
+- model: `models/kusuriya-labs/Qwen3.8-Flash-Next-EXL3-INT8-3.05bpw`
+- GPU: Radeon AI PRO R9700 × 1（`--device 3`）
+- `octave:c5v5` KV、DFlash2 chain verify（`--dflash2-tree-budget 0`）、greedy、
+  `--moe-host-experts 448`、`--max-concurrent-requests 2`、
+  `--max-num-batched-tokens 2048`、`--ple-hot-cache-gib 1`、
+  `--prefix-cache-strategy radix`。prompt は `tests/data/mtp_perf/prose.txt` を
+  model の tokenizer で encode した先頭 N token。16 token 生成（計測区間 15 token）。
+
+| context | before decode | before tok/s | after decode | after tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 8,192 | 333.6 ms | 44.97 | 316.8 ms | **47.35** |
+| 32,768 | 388.1 ms | 38.65 | 347.2 ms | **43.20** |
+
+8,192 → 32,768 の低下は before が 14.1 %、after が 8.8 % だった。
+生成結果は各 context で before / after が一致した
+（`GENERATED_IDS` の sha1: 8,192 = `2e293f3dc225966c6c7bb82b0bf00b2bb9cce82b`、
+32,768 = `8a12f56fc9e5f422a9339c6c37bc4bdf4c411d47`）。
+各値は 1 回の測定で、同一条件の連続起動で before → after の順に取った。
 
 ## 記録規則
 

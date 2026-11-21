@@ -1,7 +1,6 @@
 #include <shelf/kernels/fused/exl3/decode.h>
 #include <shelf/kernels/fused/exl3/rotate_out.h>
 #include <shelf/kernels/fused/exl3/rotate_quantize.h>
-#include <shelf/kernels/fused/exl3/epilogue.h>
 #include <shelf/kernels/fused/exl3/grouped.h>
 #include <shelf/inference/execution/optimized_dispatch.h>
 #include <shelf/kernels/optimized/linear/lm_head_int8.h>
@@ -9,6 +8,7 @@
 #include <shelf/inference/execution/final_producer.h>
 #include <shelf/inference/execution/exl3_dispatch_decision.h>
 #include <shelf/kernels/fused/fp8_activation_producer.h>
+#include <shelf/kernels/fused/mxfp4_activation_producer.h>
 #include <shelf/inference/execution/physical_launch.h>
 #include <shelf/quantization/quant_contract.h>
 #include <shelf/inference/execution/program_executor.h>
@@ -17,13 +17,11 @@
 #include <shelf/kernels/optimized/linear/fp8.h>
 #include <shelf/kernels/optimized/linear/mxfp4.h>
 #include <shelf/kernels/optimized/linear/bf16.h>
-#include <shelf/kernels/optimized/linear/exl3_mul1.h>
 #include <shelf/kernels/optimized/linear/exl3_mul24.h>
 #include <shelf/inference/execution/hyper_connection_dispatch.h>
 #include <shelf/inference/execution/ple_dispatch.h>
 #include <shelf/inference/execution/qsa_dispatch.h>
 #include <shelf/inference/execution/fp8_ptpc_dispatch.h>
-#include <shelf/kernels/optimized/linear/exl3_family/mul1/launch_plan.h>
 #include <shelf/kernels/optimized/linear/exl3_family/mul24/workspace.h>
 #include <shelf/kernels/optimized/linear/exl3_family/mul24/projection.h>
 #include <shelf/kernels/fused/exl3/producer_rotate.h>
@@ -534,171 +532,40 @@ Result<PhysicalResolveStatus> resolve_bf16_physical(
     return PhysicalResolveStatus::Applicable;
 }
 
-Result<OptimizedLaunchResult> try_launch_linear_exl3(
-    const ::shelf::runtime::Program& program,
-    const ::shelf::runtime::DispatchBinding& b,
-    HostExecutionContext& ctx,
-    hipStream_t stream) {
-    if (b.output_count != 1 || b.input_count != 1)
-        return Status::invalid_state("exl3 linear: bad io count", __FILE__, __LINE__);
-    if (b.weight_index >= ctx.weight_count || ctx.weights == nullptr)
-        return Status::invalid_state("exl3 linear: weight_index invalid", __FILE__, __LINE__);
-    const ::shelf::runtime::WeightSlot e = ctx.weights[b.weight_index];
-    if (e.encoding != 4u)
-        return Status::invalid_state("exl3 linear: encoding != exl3", __FILE__, __LINE__);
-    if (e.device_ptr != nullptr || e.codes == nullptr || e.exl3_suh == nullptr ||
-        e.exl3_svh == nullptr) {
-        return Status::invalid_state("exl3 linear: bad weight slot", __FILE__, __LINE__);
-    }
-    if (e.preshuffled)
-        return Status::invalid_state("exl3 linear: trellis must not be preshuffled", __FILE__,
-                                     __LINE__);
-    if (e.rows == 0 || e.cols == 0 || e.k_padded != e.cols)
-        return Status::invalid_state("exl3 linear: weight dims invalid", __FILE__, __LINE__);
-    auto in_res = resolve_host_value(program, ::shelf::runtime::ValueId{b.input_slots[0]}, ctx);
-    if (!in_res.ok()) return in_res.status();
-    const HostResolvedValue in = in_res.value();
-    if (in.dtype != ValueDType::BF16) return OptimizedLaunchResult{OptimizedLaunchKind::NotApplicable};
-    if (in.feature_count != e.cols)
-        return Status::invalid_state("exl3 linear: input features != weight cols", __FILE__,
-                                     __LINE__);
-    auto out_res = resolve_host_value(program, ::shelf::runtime::ValueId{b.output_slots[0]}, ctx);
-    if (!out_res.ok()) return out_res.status();
-    const HostResolvedValue dst = out_res.value();
-    const uint64_t expected_out_features =
-        e.output_col_total != 0u ? static_cast<uint64_t>(e.output_col_total)
-                                 : static_cast<uint64_t>(e.rows);
-    if (static_cast<uint64_t>(dst.feature_count) != expected_out_features)
-        return Status::invalid_state("exl3 linear: output features mismatch", __FILE__,
-                                     __LINE__);
-    if (e.output_col_total != 0u &&
-        static_cast<uint64_t>(e.output_col_offset) + e.rows >
-            static_cast<uint64_t>(e.output_col_total)) {
-        return Status::invalid_state("exl3 linear: column offset out of range", __FILE__,
-                                     __LINE__);
-    }
-    const bool out_bf16 = dst.dtype == ValueDType::BF16;
-    const bool out_f32 = dst.dtype == ValueDType::F32;
-    if (!out_bf16 && !out_f32)
-        return Status::invalid_state("exl3 linear: output dtype not BF16/F32", __FILE__,
-                                     __LINE__);
-    const uint32_t rows = rows_for(dst, ctx);
-    if (rows == 0) return OptimizedLaunchResult{OptimizedLaunchKind::Launched};
-
-    ::shelf::kernel::Exl3GemmArgs args;
-    args.trellis = e.codes;
-    args.suh = e.exl3_suh;
-    args.svh = e.exl3_svh;
-    args.input = in.ptr;
-    args.output = static_cast<void*>(
-        static_cast<uint8_t*>(dst.ptr) +
-        static_cast<uint64_t>(e.output_col_offset) * value_dtype_bytes(dst.dtype));
-    args.rows = rows;
-    args.out_features = e.rows;
-    args.k = e.cols;
-    args.input_row_stride = in.row_stride;
-    args.output_row_stride = dst.row_stride;
-    args.output_dtype = out_bf16 ? 0u : 1u;
-    args.ka = e.exl3_ka;
-    args.half = e.exl3_half ? 1u : 0u;
-    args.splitk_scratch = ctx.scratch;
-    args.splitk_floats = ctx.scratch_floats;
-    {
-        const ::shelf::kernel::Exl3Phase phase =
-            ctx.splitk_tuning_rows != 0u
-                ? ::shelf::kernel::Exl3Phase::Verify
-                : (rows >= 256u ? ::shelf::kernel::Exl3Phase::Prefill
-                                : ::shelf::kernel::Exl3Phase::Decode);
-        ::shelf::kernel::exl3_detail::apply_execution_policy(
-            args, ::shelf::kernel::Exl3ExecutionPolicy{phase, ctx.splitk_tuning_rows});
-    }
-    static const uint32_t split_override = [] {
-        const char* e = std::getenv("SHELF_EXL3_SPLIT");
-        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
+bool exl3_mul24_use_a() {
+    static const bool requested = [] {
+        const char* env = std::getenv("SHELF_EXL3_MUL24_PREFILL_AB");
+        return env == nullptr || ((env[0] == 'A' || env[0] == 'a') && env[1] == '\0');
     }();
-    args.splitk_splits = split_override;
-    static const uint32_t groups_override = [] {
-        const char* e = std::getenv("SHELF_EXL3_GROUPS");
-        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 0u;
-    }();
-    args.groups = groups_override;
-    static const uint32_t fast_decode = [] {
-        const char* e = std::getenv("SHELF_EXL3_FAST_DECODE");
-        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 10)) : 1u;
-    }();
-    args.fast_decode = fast_decode;
-    const uint64_t xrot_bytes = static_cast<uint64_t>(args.rows) * args.k * 2u;
-    static const bool pre_override = [] {
-        const char* e = std::getenv("SHELF_EXL3_PRE");
-        return e != nullptr && std::strtoul(e, nullptr, 10) == 0u;
-    }();
-    const bool use_pre = !pre_override && ctx.exl3_xrot != nullptr && args.rows >= 4u &&
-                         xrot_bytes <= ctx.exl3_xrot_bytes;
-    static const uint32_t dense_min_rows = [] {
-        const char* e = std::getenv("SHELF_EXL3_DENSE");
-        if (e == nullptr) return 256u;
-        const unsigned long v = std::strtoul(e, nullptr, 10);
-        return v == 0ul ? 0xFFFFFFFFu : static_cast<uint32_t>(v);
-    }();
-    const uint64_t dense_bytes = static_cast<uint64_t>(args.k) * args.out_features * 2u;
-    const uint64_t accum_bytes = static_cast<uint64_t>(args.rows) * args.out_features * 4u;
-    const bool use_dense = use_pre && ctx.exl3_dense != nullptr &&
-                           ctx.exl3_accum != nullptr && ctx.exl3_rowsum != nullptr &&
-                           args.rows >= dense_min_rows &&
-                           (args.out_features % 128u) == 0u &&
-                           dense_bytes <= ctx.exl3_dense_bytes &&
-                           accum_bytes <= ctx.exl3_accum_bytes &&
-                           static_cast<uint64_t>(args.rows) * sizeof(float) <=
-                               ctx.exl3_rowsum_bytes;
-    hipError_t herr = hipSuccess;
-    bool dense_done = false;
-    if (use_dense) {
-        ::shelf::kernel::Exl3GemmArgs dense_args = args;
-        dense_args.xrot = ctx.exl3_xrot;
-        herr = ::shelf::kernel::launch_rotate_exl3_rowsum(
-            dense_args, ctx.exl3_xrot, static_cast<float*>(ctx.exl3_rowsum), stream);
-        if (herr == hipSuccess) {
-            herr = ::shelf::kernel::launch_recon_exl3_dense(dense_args, ctx.exl3_dense, stream);
-        }
-        if (herr == hipSuccess) {
-            herr = ::shelf::execution::exl3_dense_gemm(dense_args, ctx.exl3_dense,
-                                                       ctx.exl3_accum, stream);
-        }
-        if (herr == hipSuccess) {
-            herr = ::shelf::kernel::launch_epilogue_exl3_dense(
-                dense_args, ctx.exl3_rowsum, ctx.exl3_accum, stream);
-        }
-        dense_done = herr == hipSuccess;
+    if (!requested) return false;
+    const char* rocroller = std::getenv("HIPBLASLT_USE_ROCROLLER");
+    if (rocroller != nullptr && std::strcmp(rocroller, "1") == 0) {
+        static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+        if (!reported.test_and_set())
+            std::fprintf(stderr, "EXL3 INT8 prefill: rocRoller selected; using B kernel\n");
+        return false;
     }
-    if (!dense_done) {
-        if (herr != hipSuccess && herr != hipErrorNotSupported)
-            return Status::hip_error("exl3 dense prefill", hipGetErrorString(herr),
-                                     __FILE__, __LINE__);
-        herr = hipSuccess;
-        if (use_pre) {
-            herr = ::shelf::kernel::launch_rotate_exl3(args, ctx.exl3_xrot, stream);
-            if (herr == hipSuccess) {
-                herr = ::shelf::kernel::launch_gemm_exl3_w16a16_pre(args, ctx.exl3_xrot,
-                                                                    stream);
-            }
-        } else {
-            herr = ::shelf::kernel::launch_gemm_exl3_w16a16(args, stream);
-        }
+    int device = -1;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    static thread_local int checked_device = -1;
+    static thread_local bool supported = false;
+    if (checked_device != device) {
+        hipDeviceProp_t props{};
+        supported = hipGetDeviceProperties(&props, device) == hipSuccess &&
+                    std::strncmp(props.gcnArchName, "gfx1201", 7u) == 0;
+        checked_device = device;
     }
-    if (herr == hipErrorNotSupported)
-        return OptimizedLaunchResult{OptimizedLaunchKind::NotApplicable};
-    if (herr != hipSuccess)
-        return Status::hip_error("exl3 gemm launch", hipGetErrorString(herr), __FILE__,
-                                 __LINE__);
-    record_physical_launch(dense_done ? 4u : (use_pre ? 2u : 1u));
-    record_optimized_op();
-    return OptimizedLaunchResult{OptimizedLaunchKind::Launched};
+    return supported;
 }
 
 bool exl3_mul24_use_dense(bool dense_ok, uint32_t n_rows, uint32_t dense_min_rows,
                           uint64_t rowsum_bytes) {
     return dense_ok && n_rows >= dense_min_rows &&
            static_cast<uint64_t>(n_rows) * sizeof(float) <= rowsum_bytes;
+}
+
+bool exl3_mul24_use_a_prefill(bool a_selected, uint32_t num_prefill_requests) {
+    return a_selected && num_prefill_requests != 0u;
 }
 
 // EXL3-INT8 (mul24): rotate + int8-quantize the activations, run the int8 WMMA GEMM that decodes the resident
@@ -761,7 +628,6 @@ Result<OptimizedLaunchResult> try_launch_linear_exl3_mul24(
     float* scales = reinterpret_cast<float*>(static_cast<uint8_t*>(ctx.exl3_xrot) + layout.scales_offset);
     float* yprime = reinterpret_cast<float*>(static_cast<uint8_t*>(ctx.exl3_accum) + layout.yprime_offset);
     const uint32_t out_elem_bytes = out_bf16 ? 2u : 4u;
-    // Prefill: like the W16A16 dense path, expand the trellis to a dense int8 matrix and run one hipBLASLt int8 GEMM.
     // That GEMM takes one activation scale per row (decode keeps one per 128-K group).
     static const uint32_t dense_min_rows = [] {
         const char* env = std::getenv("SHELF_EXL3_INT8_DENSE");
@@ -771,11 +637,7 @@ Result<OptimizedLaunchResult> try_launch_linear_exl3_mul24(
     }();
     // A: hipBLASLt row-scale dense prefill + flagged-row correction.
     // B: hand-written gfx12 iu8 WMMA, K128 scale/FMA and no row re-quantization.
-    static const bool prefill_wmma_b = [] {
-        const char* env = std::getenv("SHELF_EXL3_MUL24_PREFILL_AB");
-        if (env == nullptr) return true;
-        return (env[0] == 'B' || env[0] == 'b') && env[1] == '\0';
-    }();
+    const bool prefill_wmma_b = (e.plamo_exl3_linear && std::getenv("SHELF_EXL3_MUL24_PREFILL_AB") == nullptr) || !exl3_mul24_use_a();
     static const float flag_share = [] {
         const char* env = std::getenv("SHELF_EXL3_INT8_FLAG");
         return env != nullptr ? std::strtof(env, nullptr) : 0.5f;
@@ -805,41 +667,8 @@ Result<OptimizedLaunchResult> try_launch_linear_exl3_mul24(
             out_bf16 ? ::shelf::kernel::Exl3OutputDType::BF16 : ::shelf::kernel::Exl3OutputDType::F32;
         hipError_t herr = hipSuccess;
         bool done = false;
-        if (use_dense && prefill_wmma_b) {
-            // B uses the exact original group codes/scales and the same dense
-            // int8 weight reconstruction as A. No rowscale, slots or flagged GEMM.
-            const uint32_t timing0 = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
-            herr = ::shelf::kernel::launch_exl3_mul24_rotate_quantize(
-                x, in.row_stride, suh, codes, scales, n_rows, k, code_stride, scale_stride_bytes, stream);
-            if (semantic_timing_enabled()) semantic_timing_finish(
-                stream, timing0, 0xffff0010u, static_cast<uint32_t>(SemPath::Optimized), 0);
-            if (herr == hipSuccess) {
-                const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
-                herr = ::shelf::kernel::launch_exl3_mul24_recon_wmma(
-                    static_cast<const uint16_t*>(e.codes), e.exl3_ka,
-                    static_cast<int8_t*>(ctx.exl3_dense), n, k, stream);
-                if (semantic_timing_enabled()) semantic_timing_finish(
-                    stream, timing, 0xffff0011u, static_cast<uint32_t>(SemPath::Optimized), 0);
-            }
-            if (herr == hipSuccess) {
-                const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
-                herr = ::shelf::kernel::launch_exl3_mul24_prefill_wmma(
-                    codes, scales, code_stride, scale_stride_bytes,
-                    static_cast<const int8_t*>(ctx.exl3_dense), yprime, n_rows, n, k, stream);
-                if (semantic_timing_enabled()) semantic_timing_finish(
-                    stream, timing, 0xffff0012u, static_cast<uint32_t>(SemPath::Optimized), 0);
-            }
-            if (herr == hipSuccess) {
-                const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
-                herr = ::shelf::kernel::launch_exl3_mul24_rotate_out(
-                    yprime, svh, out_ptr, out_dtype, n_rows, n, dst.row_stride, 1u, stream);
-                if (semantic_timing_enabled()) semantic_timing_finish(
-                    stream, timing, 0xffff0013u, static_cast<uint32_t>(SemPath::Optimized), 0);
-            }
-            done = herr == hipSuccess;
-            launches += done ? 4u : 0u;
-        }
-        if (use_dense && !prefill_wmma_b) {
+        bool fallback_b = false;
+        if (use_dense && exl3_mul24_use_a_prefill(!prefill_wmma_b, ctx.num_prefill_requests)) {
             float* rowscale = static_cast<float*>(ctx.exl3_rowsum);
             int8_t* dense = static_cast<int8_t*>(ctx.exl3_dense);
             uint8_t* xr = static_cast<uint8_t*>(ctx.exl3_xrot);
@@ -877,6 +706,13 @@ Result<OptimizedLaunchResult> try_launch_linear_exl3_mul24(
             if (herr == hipSuccess) {
                 const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
                 herr = ::shelf::execution::exl3_dense_gemm_int8(n_rows, n, k, dense, codes, yprime, stream);
+                if (herr == hipErrorNotSupported || herr == hipErrorInitializationError ||
+                    herr == hipErrorOutOfMemory) {
+                    static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+                    if (!reported.test_and_set())
+                        std::fprintf(stderr, "EXL3 INT8 prefill: hipBLASLt unavailable; using B kernel\n");
+                    herr = hipErrorNotSupported;
+                }
                 if (semantic_timing_enabled())
                     semantic_timing_finish(stream, timing, 0xffff0003u,
                                            static_cast<uint32_t>(SemPath::Optimized), 0);
@@ -914,8 +750,44 @@ Result<OptimizedLaunchResult> try_launch_linear_exl3_mul24(
             }
             done = herr == hipSuccess;
             launches += done ? 7u : 0u;
-            // hipBLASLt has no int8 algorithm for this shape: run the fused kernel instead (it needs the group scales back).
-            if (herr == hipErrorNotSupported) herr = hipSuccess;
+            if (herr == hipErrorNotSupported) {
+                fallback_b = true;
+                herr = hipSuccess;
+            }
+        }
+        if (use_dense && (prefill_wmma_b || fallback_b)) {
+            // B uses the exact original group codes/scales and the same dense
+            // int8 weight reconstruction as A. No rowscale, slots or flagged GEMM.
+            const uint32_t timing0 = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
+            herr = ::shelf::kernel::launch_exl3_mul24_rotate_quantize(
+                x, in.row_stride, suh, codes, scales, n_rows, k, code_stride, scale_stride_bytes, stream);
+            if (semantic_timing_enabled()) semantic_timing_finish(
+                stream, timing0, 0xffff0010u, static_cast<uint32_t>(SemPath::Optimized), 0);
+            if (herr == hipSuccess) {
+                const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
+                herr = ::shelf::kernel::launch_exl3_mul24_recon_wmma(
+                    static_cast<const uint16_t*>(e.codes), e.exl3_ka,
+                    static_cast<int8_t*>(ctx.exl3_dense), n, k, stream);
+                if (semantic_timing_enabled()) semantic_timing_finish(
+                    stream, timing, 0xffff0011u, static_cast<uint32_t>(SemPath::Optimized), 0);
+            }
+            if (herr == hipSuccess) {
+                const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
+                herr = ::shelf::kernel::launch_exl3_mul24_prefill_wmma(
+                    codes, scales, code_stride, scale_stride_bytes,
+                    static_cast<const int8_t*>(ctx.exl3_dense), yprime, n_rows, n, k, stream);
+                if (semantic_timing_enabled()) semantic_timing_finish(
+                    stream, timing, 0xffff0012u, static_cast<uint32_t>(SemPath::Optimized), 0);
+            }
+            if (herr == hipSuccess) {
+                const uint32_t timing = semantic_timing_enabled() ? semantic_timing_start(stream) : 0xffffffffu;
+                herr = ::shelf::kernel::launch_exl3_mul24_rotate_out(
+                    yprime, svh, out_ptr, out_dtype, n_rows, n, dst.row_stride, 1u, stream);
+                if (semantic_timing_enabled()) semantic_timing_finish(
+                    stream, timing, 0xffff0013u, static_cast<uint32_t>(SemPath::Optimized), 0);
+            }
+            done = herr == hipSuccess;
+            launches += done ? 4u : 0u;
         }
         if (!done && herr == hipSuccess) {
             uint32_t splits = ::shelf::kernel::exl3_mul24_gemm_splits(n_rows, n, k, scratch_rows, e.exl3_ka);
@@ -1087,8 +959,10 @@ Result<OptimizedLaunchResult> try_launch_exl3_projection(
         output.value().dtype != ValueDType::BF16 ||
         ctx.exl3_xrot == nullptr || ctx.exl3_accum == nullptr)
         return miss;
-    static const bool custom_prefill = std::getenv("SHELF_EXL3_INT8_DENSE") != nullptr ||
-        std::getenv("SHELF_EXL3_MUL24_PREFILL_AB") != nullptr;
+    const bool custom_prefill = std::getenv("SHELF_EXL3_INT8_DENSE") != nullptr ||
+        (is_plamo && std::getenv("SHELF_EXL3_MUL24_PREFILL_AB") != nullptr) ||
+        (!is_plamo && rows > 16u && exl3_mul24_use_a_prefill(exl3_mul24_use_a(),
+                                                             ctx.num_prefill_requests));
     if (custom_prefill)
         return miss;
     uint32_t count = 0u;
@@ -1556,6 +1430,306 @@ Result<OptimizedLaunchResult> try_launch_fp8_residual_norm_quantize(
     return OptimizedLaunchResult{OptimizedLaunchKind::Launched, 3u};
 }
 
+bool mxfp4_producer_enabled() {
+    static const bool enabled = std::getenv("SHELF_DISABLE_MXFP4_PRODUCER") == nullptr &&
+        std::getenv("SHELF_OP_DUMP") == nullptr && std::getenv("SHELF_OP_SYNC") == nullptr &&
+        std::getenv("SHELF_LINEAR_INPUT_DUMP") == nullptr;
+    return enabled;
+}
+
+bool mxfp4_quant_consumer_matches(const ::shelf::runtime::Program& program, size_t qi,
+                                  size_t li, const HostExecutionContext& ctx,
+                                  PhysicalActivationQuantizeLaunch& q) {
+    const auto& quant = program.dispatches[qi];
+    const auto& linear = program.dispatches[li];
+    if (quant.kernel_id != KernelId::ACTIVATION_QUANTIZE_MXFP4_ROWREF ||
+        linear.kernel_id != KernelId::LINEAR_MXFP4_W4A8)
+        return false;
+    if (quant.input_count != 1u || quant.workspace_slot == ::shelf::runtime::kNoWorkspace ||
+        quant.workspace_slot != linear.workspace_slot || linear.input_count != 0u ||
+        linear.output_count != 1u)
+        return false;
+    if (linear.weight_index >= ctx.weight_count) return false;
+    const auto& w = ctx.weights[linear.weight_index];
+    if (w.encoding != static_cast<uint8_t>(::shelf::weights::MatrixEncoding::Mxfp4))
+        return false;
+    auto resolved = resolve_activation_quantize_physical(program, quant, ctx, q);
+    if (!resolved.ok() || resolved.value() != PhysicalResolveStatus::Applicable)
+        return false;
+    if (q.row_index != 0u || q.codes == 0u || q.scales == 0u || q.rows == 0u ||
+        q.k == 0u || q.k_padded < q.k || q.code_row_stride < q.k_padded ||
+        q.scale_row_stride == 0u)
+        return false;
+    {
+        const uint32_t groups = (q.k_padded + 127u) / 128u;
+        if (q.scale_row_stride < groups * static_cast<uint32_t>(sizeof(float)))
+            return false;
+    }
+    return w.cols == q.k && w.k_padded == q.k_padded;
+}
+
+bool mxfp4_value_is_exclusive(const ::shelf::runtime::Program& program, uint32_t slot, size_t from,
+                              size_t until) {
+    for (size_t j = from; j < until; ++j)
+        for (uint32_t n = 0; n < program.dispatches[j].input_count; ++n)
+            if (program.dispatches[j].input_slots[n] == slot) return false;
+    return true;
+}
+
+Result<OptimizedLaunchResult> try_launch_mxfp4_swiglu_quantize(
+    const ::shelf::runtime::Program& program, size_t i, size_t end, HostExecutionContext& ctx,
+    hipStream_t stream) {
+    const OptimizedLaunchResult miss{OptimizedLaunchKind::NotApplicable};
+    if (!mxfp4_producer_enabled() || ctx.value_trace || ctx.layer_override_count ||
+        i + 2u >= end || ctx.workspace == nullptr || ctx.weights == nullptr) return miss;
+    const auto& swiglu = program.dispatches[i];
+    const auto& quant = program.dispatches[i + 1u];
+    if (swiglu.kernel_id != KernelId::SWIGLU || swiglu.input_count != 2u ||
+        swiglu.output_count != 1u)
+        return miss;
+    PhysicalActivationQuantizeLaunch q{};
+    if (!mxfp4_quant_consumer_matches(program, i + 1u, i + 2u, ctx, q)) return miss;
+    if (swiglu.output_slots[0] != quant.input_slots[0]) return miss;
+    if (!mxfp4_value_is_exclusive(program, swiglu.output_slots[0], i + 2u,
+                                  program.dispatches.size()))
+        return miss;
+    PhysicalElementwiseLaunch elem{};
+    auto resolved = resolve_elementwise_physical(program, swiglu, ctx, elem);
+    if (!resolved.ok()) return resolved.status();
+    if (resolved.value() != PhysicalResolveStatus::Applicable ||
+        elem.profile != ElementwiseProfile::SwigluBf16 || elem.rows != q.rows ||
+        elem.features != q.k || !elem.in0 || !elem.in1 ||
+        elem.in0_stride < elem.features || elem.in1_stride < elem.features)
+        return miss;
+    ::shelf::execution::Mxfp4SwigluArgs args{};
+    args.gate = reinterpret_cast<const ::shelf::bf16_t*>(elem.in0);
+    args.up = reinterpret_cast<const ::shelf::bf16_t*>(elem.in1);
+    args.codes = reinterpret_cast<uint8_t*>(q.codes);
+    args.scales = reinterpret_cast<float*>(q.scales);
+    args.rows = q.rows;
+    args.k = q.k;
+    args.k_padded = q.k_padded;
+    args.gate_stride = elem.in0_stride;
+    args.up_stride = elem.in1_stride;
+    args.code_stride = q.code_row_stride;
+    args.scale_stride = q.scale_row_stride;
+    args.bf16_intermediate = elem.aux != 0u;
+    const hipError_t herr = ::shelf::execution::launch_mxfp4_swiglu_quantize(args, stream);
+    if (herr != hipSuccess)
+        return Status::hip_error("mxfp4 swiglu quantize launch", hipGetErrorString(herr),
+                                 __FILE__, __LINE__);
+    record_physical_launch(1);
+    record_optimized_op();
+    return OptimizedLaunchResult{OptimizedLaunchKind::Launched, 2u};
+}
+
+Result<OptimizedLaunchResult> try_launch_mxfp4_norm_quantize(
+    const ::shelf::runtime::Program& program, size_t i, size_t end, HostExecutionContext& ctx,
+    hipStream_t stream) {
+    const OptimizedLaunchResult miss{OptimizedLaunchKind::NotApplicable};
+    if (!mxfp4_producer_enabled() || ctx.value_trace || ctx.layer_override_count ||
+        i + 2u >= end || ctx.workspace == nullptr || ctx.weights == nullptr) return miss;
+    const auto& norm = program.dispatches[i];
+    const auto& quant = program.dispatches[i + 1u];
+    if (norm.kernel_id != KernelId::RMS_NORM || norm.input_count != 1u ||
+        norm.output_count != 1u)
+        return miss;
+    PhysicalActivationQuantizeLaunch q{};
+    if (!mxfp4_quant_consumer_matches(program, i + 1u, i + 2u, ctx, q)) return miss;
+    if (norm.output_slots[0] != quant.input_slots[0]) return miss;
+    const auto* binding = program.find_value(::shelf::runtime::ValueId{norm.output_slots[0]});
+    if (binding == nullptr ||
+        (binding->storage != ::shelf::runtime::ValueStorage::WORKSPACE &&
+         binding->storage != ::shelf::runtime::ValueStorage::WORKSPACE_VIEW))
+        return miss;
+    if (!mxfp4_value_is_exclusive(program, norm.output_slots[0], i + 2u,
+                                  program.dispatches.size()))
+        return miss;
+    PhysicalRmsNormLaunch n{};
+    auto resolved_norm = resolve_rmsnorm_physical(program, norm, ctx, n);
+    if (!resolved_norm.ok()) return resolved_norm.status();
+    if (resolved_norm.value() != PhysicalResolveStatus::Applicable ||
+        n.variant != PhysicalRmsNormVariant::Bf16PfOnePlus || n.rows != q.rows ||
+        n.features != q.k || n.group_size != q.k || !n.weight)
+        return miss;
+    auto input = resolve_host_value(program, ::shelf::runtime::ValueId{norm.input_slots[0]}, ctx);
+    if (!input.ok()) return input.status();
+    if (input.value().dtype != ValueDType::BF16 || input.value().feature_count != q.k ||
+        input.value().row_stride < q.k || input.value().ptr == nullptr)
+        return miss;
+    ::shelf::execution::Mxfp4NormArgs args{};
+    args.input = static_cast<const ::shelf::bf16_t*>(input.value().ptr);
+    args.weight = reinterpret_cast<const ::shelf::bf16_t*>(n.weight);
+    args.codes = reinterpret_cast<uint8_t*>(q.codes);
+    args.scales = reinterpret_cast<float*>(q.scales);
+    args.rows = q.rows;
+    args.k = q.k;
+    args.k_padded = q.k_padded;
+    args.input_stride = input.value().row_stride;
+    args.code_stride = q.code_row_stride;
+    args.scale_stride = q.scale_row_stride;
+    args.eps = n.eps;
+    const hipError_t herr = ::shelf::execution::launch_mxfp4_norm_quantize(args, stream);
+    if (herr != hipSuccess)
+        return Status::hip_error("mxfp4 norm quantize launch", hipGetErrorString(herr),
+                                 __FILE__, __LINE__);
+    record_physical_launch(1);
+    record_optimized_op();
+    return OptimizedLaunchResult{OptimizedLaunchKind::Launched, 2u};
+}
+
+Result<OptimizedLaunchResult> try_launch_mxfp4_residual_norm_quantize(
+    const ::shelf::runtime::Program& program, size_t i, size_t end, HostExecutionContext& ctx,
+    hipStream_t stream) {
+    const OptimizedLaunchResult miss{OptimizedLaunchKind::NotApplicable};
+    if (!mxfp4_producer_enabled() || ctx.value_trace || ctx.layer_override_count ||
+        i + 3u >= end || ctx.workspace == nullptr || ctx.weights == nullptr) return miss;
+    const auto& add = program.dispatches[i];
+    const auto& norm = program.dispatches[i + 1u];
+    const auto& quant = program.dispatches[i + 2u];
+    if (add.kernel_id != KernelId::RESIDUAL_ADD || add.input_count != 2u ||
+        add.output_count != 1u || norm.kernel_id != KernelId::RMS_NORM ||
+        norm.input_count != 1u || norm.output_count != 1u)
+        return miss;
+    PhysicalActivationQuantizeLaunch q{};
+    if (!mxfp4_quant_consumer_matches(program, i + 2u, i + 3u, ctx, q)) return miss;
+    if (add.output_slots[0] != norm.input_slots[0] ||
+        norm.output_slots[0] != quant.input_slots[0])
+        return miss;
+    const auto* binding = program.find_value(::shelf::runtime::ValueId{norm.output_slots[0]});
+    if (binding == nullptr ||
+        (binding->storage != ::shelf::runtime::ValueStorage::WORKSPACE &&
+         binding->storage != ::shelf::runtime::ValueStorage::WORKSPACE_VIEW))
+        return miss;
+    if (!mxfp4_value_is_exclusive(program, norm.output_slots[0], i + 3u,
+                                  program.dispatches.size()))
+        return miss;
+    PhysicalRmsNormLaunch n{};
+    auto resolved_norm = resolve_rmsnorm_physical(program, norm, ctx, n);
+    if (!resolved_norm.ok()) return resolved_norm.status();
+    if (resolved_norm.value() != PhysicalResolveStatus::Applicable ||
+        n.variant != PhysicalRmsNormVariant::Bf16PfOnePlus || n.rows != q.rows ||
+        n.features != q.k || n.group_size != q.k || !n.weight)
+        return miss;
+    auto a = resolve_host_value(program, ::shelf::runtime::ValueId{add.input_slots[0]}, ctx);
+    auto b = resolve_host_value(program, ::shelf::runtime::ValueId{add.input_slots[1]}, ctx);
+    auto r = resolve_host_value(program, ::shelf::runtime::ValueId{add.output_slots[0]}, ctx);
+    if (!a.ok()) return a.status();
+    if (!b.ok()) return b.status();
+    if (!r.ok()) return r.status();
+    if (a.value().dtype != ValueDType::BF16 || b.value().dtype != ValueDType::BF16 ||
+        r.value().dtype != ValueDType::BF16 || a.value().feature_count != q.k ||
+        b.value().feature_count != q.k || r.value().feature_count != q.k ||
+        a.value().row_stride < q.k || b.value().row_stride < q.k ||
+        r.value().row_stride < q.k ||
+        a.value().ptr == nullptr || b.value().ptr == nullptr || r.value().ptr == nullptr ||
+        rows_for(r.value(), ctx) != q.rows)
+        return miss;
+    ::shelf::execution::Mxfp4ResidualNormArgs args{};
+    args.a = static_cast<const ::shelf::bf16_t*>(a.value().ptr);
+    args.b = static_cast<const ::shelf::bf16_t*>(b.value().ptr);
+    args.residual = static_cast<::shelf::bf16_t*>(r.value().ptr);
+    args.weight = reinterpret_cast<const ::shelf::bf16_t*>(n.weight);
+    args.codes = reinterpret_cast<uint8_t*>(q.codes);
+    args.scales = reinterpret_cast<float*>(q.scales);
+    args.rows = q.rows;
+    args.k = q.k;
+    args.k_padded = q.k_padded;
+    args.a_stride = a.value().row_stride;
+    args.b_stride = b.value().row_stride;
+    args.residual_stride = r.value().row_stride;
+    args.code_stride = q.code_row_stride;
+    args.scale_stride = q.scale_row_stride;
+    args.eps = n.eps;
+    const hipError_t herr =
+        ::shelf::execution::launch_mxfp4_residual_norm_quantize(args, stream);
+    if (herr != hipSuccess)
+        return Status::hip_error("mxfp4 residual norm quantize launch",
+                                 hipGetErrorString(herr), __FILE__, __LINE__);
+    record_physical_launch(1);
+    record_optimized_op();
+    return OptimizedLaunchResult{OptimizedLaunchKind::Launched, 3u};
+}
+
+Result<OptimizedLaunchResult> try_launch_mxfp4_gdn_gated_quantize(
+    const ::shelf::runtime::Program& program, size_t i, size_t end, HostExecutionContext& ctx,
+    hipStream_t stream) {
+    const OptimizedLaunchResult miss{OptimizedLaunchKind::NotApplicable};
+    if (!mxfp4_producer_enabled() || ctx.value_trace || ctx.layer_override_count ||
+        i + 4u >= end || ctx.workspace == nullptr || ctx.weights == nullptr) return miss;
+    const auto& norm = program.dispatches[i];
+    const auto& silu = program.dispatches[i + 1u];
+    const auto& mul = program.dispatches[i + 2u];
+    const auto& quant = program.dispatches[i + 3u];
+    if (norm.kernel_id != KernelId::RMS_NORM || silu.kernel_id != KernelId::SILU ||
+        mul.kernel_id != KernelId::MUL || norm.output_count != 1u ||
+        silu.output_count != 1u || mul.input_count != 2u || mul.output_count != 1u)
+        return miss;
+    PhysicalActivationQuantizeLaunch q{};
+    if (!mxfp4_quant_consumer_matches(program, i + 3u, i + 4u, ctx, q)) return miss;
+    if (norm.output_slots[0] != mul.input_slots[0] ||
+        silu.output_slots[0] != mul.input_slots[1] ||
+        mul.output_slots[0] != quant.input_slots[0]) {
+        return miss;
+    }
+    if (!mxfp4_value_is_exclusive(program, norm.output_slots[0], i + 4u,
+                                  program.dispatches.size()) ||
+        !mxfp4_value_is_exclusive(program, silu.output_slots[0], i + 4u,
+                                  program.dispatches.size()) ||
+        !mxfp4_value_is_exclusive(program, mul.output_slots[0], i + 4u,
+                                  program.dispatches.size()))
+        return miss;
+    PhysicalRmsNormLaunch n{};
+    auto resolved_norm = resolve_rmsnorm_physical(program, norm, ctx, n);
+    if (!resolved_norm.ok()) return resolved_norm.status();
+    if (resolved_norm.value() != PhysicalResolveStatus::Applicable ||
+        n.variant != PhysicalRmsNormVariant::F32PgDirect || n.rows != q.rows ||
+        n.features != q.k || n.group_size != 128u || !n.weight) {
+        return miss;
+    }
+    PhysicalElementwiseLaunch z{};
+    auto resolved_silu = resolve_elementwise_physical(program, silu, ctx, z);
+    if (!resolved_silu.ok()) return resolved_silu.status();
+    if (resolved_silu.value() != PhysicalResolveStatus::Applicable ||
+        z.profile != ElementwiseProfile::SiluBf16ToF32 || z.rows != q.rows ||
+        z.features != q.k)
+        return miss;
+    PhysicalElementwiseLaunch m{};
+    auto resolved_mul = resolve_elementwise_physical(program, mul, ctx, m);
+    if (!resolved_mul.ok()) return resolved_mul.status();
+    if (resolved_mul.value() != PhysicalResolveStatus::Applicable ||
+        m.profile != ElementwiseProfile::MulF32F32ToBf16 || m.rows != q.rows ||
+        m.features != q.k || z.in0_stride < q.k)
+        return miss;
+    auto rec = resolve_host_value(program, ::shelf::runtime::ValueId{norm.input_slots[0]}, ctx);
+    if (!rec.ok()) return rec.status();
+    if (rec.value().dtype != ValueDType::F32 || rec.value().feature_count != q.k ||
+        rec.value().row_stride < q.k || rec.value().ptr == nullptr)
+        return miss;
+    ::shelf::execution::Mxfp4GdnGatedArgs args{};
+    args.rec = static_cast<const float*>(rec.value().ptr);
+    args.z = reinterpret_cast<const ::shelf::bf16_t*>(z.in0);
+    args.weight = reinterpret_cast<const ::shelf::bf16_t*>(n.weight);
+    args.codes = reinterpret_cast<uint8_t*>(q.codes);
+    args.scales = reinterpret_cast<float*>(q.scales);
+    args.rows = q.rows;
+    args.features = q.k;
+    args.group_size = n.group_size;
+    args.rec_stride = rec.value().row_stride;
+    args.z_stride = z.in0_stride;
+    args.code_stride = q.code_row_stride;
+    args.scale_stride = q.scale_row_stride;
+    args.eps = n.eps;
+    const hipError_t herr =
+        ::shelf::execution::launch_mxfp4_gdn_gated_quantize(args, stream);
+    if (herr != hipSuccess)
+        return Status::hip_error("mxfp4 gdn gated quantize launch",
+                                 hipGetErrorString(herr), __FILE__, __LINE__);
+    record_physical_launch(1);
+    record_optimized_op();
+    return OptimizedLaunchResult{OptimizedLaunchKind::Launched, 4u};
+}
+
 Result<OptimizedLaunchResult> try_launch_fp8_final_gather(
     const ::shelf::runtime::Program& program, size_t i, size_t end,
     HostExecutionContext& ctx, hipStream_t stream) {
@@ -1793,12 +1967,10 @@ Result<OptimizedLaunchResult> try_launch_optimized(
             return try_launch_moe_plan_scatter(program, b, ctx, stream);
         case KernelId::LINEAR_MXFP4_W4A8_GROUPED:
             return try_launch_moe_grouped_linear(program, b, ctx, stream);
-        case KernelId::LINEAR_EXL3_W16A16_GROUPED:
+        case KernelId::LINEAR_EXL3_INT8_GROUPED:
             return try_launch_moe_grouped_exl3(program, b, ctx, stream);
         case KernelId::MOE_COMBINE:
             return try_launch_moe_combine(program, b, ctx, stream);
-        case KernelId::LINEAR_EXL3_W16A16:
-            return try_launch_linear_exl3(program, b, ctx, stream);
         case KernelId::LINEAR_EXL3_INT8: {
             auto projected = try_launch_exl3_projection(program, dispatch_index, dispatch_end, ctx, stream);
             if (!projected.ok() || projected.value().kind == OptimizedLaunchKind::Launched) return projected;
@@ -1811,6 +1983,14 @@ Result<OptimizedLaunchResult> try_launch_optimized(
         case KernelId::RMS_NORM: {
             auto fp8 = try_launch_fp8_norm_quantize(program, dispatch_index, dispatch_end, ctx, stream);
             if (!fp8.ok() || fp8.value().kind == OptimizedLaunchKind::Launched) return fp8;
+            auto gdn_mxfp4 = try_launch_mxfp4_gdn_gated_quantize(
+                program, dispatch_index, dispatch_end, ctx, stream);
+            if (!gdn_mxfp4.ok() || gdn_mxfp4.value().kind == OptimizedLaunchKind::Launched)
+                return gdn_mxfp4;
+            auto mxfp4 = try_launch_mxfp4_norm_quantize(
+                program, dispatch_index, dispatch_end, ctx, stream);
+            if (!mxfp4.ok() || mxfp4.value().kind == OptimizedLaunchKind::Launched)
+                return mxfp4;
             static const bool enabled = [] {
                 const char* env = std::getenv("SHELF_PLAMO_EXL3_NORM_ROTATE");
                 return (env == nullptr || std::strcmp(env, "0") != 0) &&
@@ -1851,6 +2031,10 @@ Result<OptimizedLaunchResult> try_launch_optimized(
         case KernelId::SWIGLU: {
             auto fp8 = try_launch_fp8_swiglu_quantize(program, dispatch_index, dispatch_end, ctx, stream);
             if (!fp8.ok() || fp8.value().kind == OptimizedLaunchKind::Launched) return fp8;
+            auto mxfp4 = try_launch_mxfp4_swiglu_quantize(
+                program, dispatch_index, dispatch_end, ctx, stream);
+            if (!mxfp4.ok() || mxfp4.value().kind == OptimizedLaunchKind::Launched)
+                return mxfp4;
             static const bool rq_enabled = std::getenv("SHELF_DISABLE_SWIGLU_RQ") == nullptr &&
                 std::getenv("SHELF_OP_DUMP") == nullptr && std::getenv("SHELF_OP_SYNC") == nullptr &&
                 std::getenv("SHELF_LINEAR_INPUT_DUMP") == nullptr &&
@@ -2003,6 +2187,10 @@ Result<OptimizedLaunchResult> try_launch_optimized(
             auto fp8 = try_launch_fp8_residual_norm_quantize(
                 program, dispatch_index, dispatch_end, ctx, stream);
             if (!fp8.ok() || fp8.value().kind == OptimizedLaunchKind::Launched) return fp8;
+            auto mxfp4 = try_launch_mxfp4_residual_norm_quantize(
+                program, dispatch_index, dispatch_end, ctx, stream);
+            if (!mxfp4.ok() || mxfp4.value().kind == OptimizedLaunchKind::Launched)
+                return mxfp4;
             if (dispatch_index + 2u < dispatch_end &&
                 program.dispatches[dispatch_index + 1u].kernel_id == KernelId::RMS_NORM &&
                 program.dispatches[dispatch_index + 2u].kernel_id == KernelId::LINEAR_EXL3_INT8) {

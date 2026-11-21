@@ -107,6 +107,11 @@ VRAM 在籍率 160/256 = 62.5% とほぼ同じで、8 step では頻度 swap の
 | `SHELF_MOE_CACHE_MIN_GAIN` | 150 | 交換に必要な頻度比（%） |
 | `SHELF_MOE_CACHE_DECAY` | 4096 | 累積頻度のピークがこれを超えたら全体を 0.7 倍 |
 
+2026-11-19 の修正で、route 数が 層×local expert を超える batch は計画した交換をその
+step で全数消化するようになり、`SHELF_MOE_CACHE_BURST_SWAPS`（`--moe-cache-burst`）は
+削除された。経緯は
+[../20261119/moe_cache_chunk_dependent_decode.md](../20261119/moe_cache_chunk_dependent_decode.md)。
+
 結果（`--tokens 128`、交換後）: ヒット率 21.2 % → 累積 69.3 %（直近区間 92.8 %）、
 per-token 68.9 ms → 38.0 ms。`--tokens 256` では累積 70.1 %（直近 92.6 %）/
 38.6 ms。再配置は約 4 900 組、PCIe 約 26 GB の一括コスト（約 1.0 s）で、
@@ -181,3 +186,47 @@ AVX512 GEMV と同期経路は GPU 経路とビット一致まで詰めたが、
 4. `hipExtMallocWithFlags(..., hipMallocSignalMemory)` はこの環境で
    `invalid argument` を返す（`hipDeviceAttributeCanUseStreamWaitValue` は 1）。
    signal memory を使う `hipStreamWaitValue32` 方式は採れない。
+
+## Qwen4Exp で DFlash2 を動かすまでの修正
+
+このモデル（Qwen3.8-Flash-Next）で DFlash2 を有効にすると、次の 4 箇所で止まった。
+
+| 症状 | 原因 | 対応 |
+| --- | --- | --- |
+| `proposal shard head encoding is unsupported`（TP=2） | lm_head が BF16。sharded proposal は Int8W32 / Exl3 のみ | lm_head を load 時に INT8 W32 化（既定 ON、`--lm-head-int8 0` で無効）＋ shard に BF16 exact-rows 経路を追加 |
+| `Qwen4Exp matrix has an unexpected encoding: lm_head`、`lm_head is not EXL3 or BF16` | Qwen4Exp の load 検証が Int8W32 を拒否 | 検証を Int8W32 許容に拡張 |
+| `the PLE input gather needs host token ids`（TP=1） | speculative verify の batch が device 側 token ids を使う | PLE モデルでは host token ids を強制（`DFlash2SpecDecoderConfig::host_token_ids` を Qwen4Exp で有効化） |
+| `Qwen4Exp requires --tensor-parallel 2 or 4` | compute runtime の制限 | TP=1 を許可（tg と同じ単 GPU 構成） |
+
+結果（prompt 4096、`octave:c5v5`、drafts 6、tree-budget 0、単一リクエスト）:
+
+| 構成 | decode | 受理 |
+| --- | ---: | ---: |
+| TP=2 spec なし | 15.19 tok/s（65.8 ms/token） | - |
+| TP=2 DFlash2 | 38.70 tok/s（25.8 ms/token） | full 0.636 / 平均 4.18 drafts |
+| TP=1 DFlash2 | 46.58 tok/s（21.5 ms/token） | full 0.889 / 平均 5.33 drafts |
+
+prompt が同一 token の繰り返し（id=1）なので受理率は実運用より高い。TP=2 の DFlash2 は
+`DFLASH2_D2H_MS` が 11 round で 111 ms あり、host token ids の往復が次の削減対象である。
+
+## host plane を別 stream で重ねる案（REJECT）
+
+miss（host plane）は PCIe 律速、hit（resident plane）は演算律速なので、2 本の stream に
+分けて重ねれば PCIe を隠せると考えて実装した（executor に aux stream と 2 つの event、
+`--moe-miss-overlap`）。計測は `shelf-bench tg --context 3072 --tokens 128
+--moe-host-experts 384`。
+
+| 実行 | per-token | p50 | LOGITS |
+| --- | ---: | ---: | --- |
+| overlap=0 | 37.76 ms | 37.47 ms | max=21.077881 sum=-552621.438 |
+| overlap=1 | 37.91 ms | 37.53 ms | max=21.826017 sum=-580326.312 |
+| overlap=0 | 37.65 ms | 37.42 ms | max=21.077881 sum=-552621.438 |
+| overlap=1 | 37.86 ms | 37.58 ms | max=21.077881 sum=-552621.438 |
+
+- 性能差は ±0.5 % で、重ねても PCIe は隠れなかった。miss の読み出しは hit と同じ
+  kernel（同じ SM 資源）を奪い合うため、帯域ではなく SM が律速になっている。
+- 同じ config の overlap=1 で LOGITS が 1 回だけ変わった。event 待ちが効かず plan を
+  読み違える競合が疑わしい（`shelf-bench` は legacy default stream を使う）。
+  再現性が無いため不採用とし、実装は stash に退避した。
+- 副産物: 最初の測定（96.7 ms/token）は同一ホストで走っていた別の pp 計測による
+  PCIe 競合で汚染されていた。単独実行では再現しない。

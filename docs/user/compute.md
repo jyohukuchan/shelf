@@ -13,6 +13,17 @@ TP、pipeline parallel、MTP、DFlash2、2048 token 超の長文は未対応。
 2B の teacher-forced 比較では CPU BF16 参照との top-1 に不一致がある。
 入力 ID の作り方と測定結果は [PLaMo 3 開発メモ](../developer/plamo3.md) を参照。
 
+## EXL3-INT8 prefill
+
+gfx1201 の EXL3-INT8（mul24）は、256 行以上の prefill について 2 つの経路を持つ。
+
+- **A 経路（既定、`SHELF_EXL3_MUL24_PREFILL_AB=A`）**: trellis を dense INT8 行列へ展開し、hipBLASLt の INT8 GEMM（行単位 scale + massive activation 行の融合補正）で計算する。高スループット。
+- **B 経路（`SHELF_EXL3_MUL24_PREFILL_AB=B`）**: 自前 gfx12 iu8 WMMA カーネルで K128 group scale のまま計算する（行再量子化なし）。
+
+hipBLASLt の INT8 algorithm が利用できない場合、ABI 検査に失敗した場合、または `HIPBLASLT_USE_ROCROLLER=1` が指定されている場合は、自動で B 経路へ切り替わる（stderr に 1 行通知）。decode と verify は融合経路を使う。PLaMo 3 は未指定時に独自 prefill 経路を維持する。
+
+prefill の chunk 境界や prefix cache の有無によって、同じ入力の出力が bit 単位で変わる場合がある。通常生成と DFlash2 の出力不一致は B 経路でも観測されている。BF16 比の精度と測定条件は [EXL3-INT8 prefill の品質](../perf/exl3-int8-prefill-quality.md)、関連する環境変数の一覧は [env_vars.md](env_vars.md#3-exl3--exl3-int8mul24経路制御) を参照。
+
 ## options
 
 <!-- cli:compute -->
@@ -26,10 +37,12 @@ TP、pipeline parallel、MTP、DFlash2、2048 token 超の長文は未対応。
 | `--page-tokens N` | paged KV page size in tokens (default 16) |
 | `--max-concurrent-requests N` | max in-flight requests (default 4) |
 | `--max-num-batched-tokens N` | token budget per scheduled step; also sets the executor row bucket (default 2048) |
+| `--prefill-chunk N` | prompt tokens per prefill step; also caps the row bucket (default 512; serve caps max-num-batched-tokens when given) |
 | `--ple-prefetch 0\|1` | prefetch the next PLE rows during prefill (default 1) |
-| `--device N\|N,M` | GPU device(s); count must match --tensor-parallel or --pipeline-parallel (default 0) |
+| `--device N\|N,M` | GPU device(s); count must match pipeline_parallel * expert_parallel * tensor_parallel (default 0) |
 | `--tensor-parallel N` | tensor parallel degree 1 \| 2 \| 4 (default 1) |
-| `--pipeline-parallel N` | pipeline-parallel stage count (default 1; requires --tensor-parallel 1) |
+| `--expert-parallel N` | expert parallel degree 1 \| 2 \| 4 (default 1) |
+| `--pipeline-parallel N` | pipeline-parallel stage count (default 1) |
 | `--kv-cache-dtype TYPE` | bf16 \| fp8 \| octave:cKvV \| octave:bRnNvV (default bf16) |
 | `--rope-factor MODE` | auto \| 1 \| 2 \| 4; static YaRN rope factor (default auto = model config: native unless the checkpoint requests yarn) |
 | `--decode-backend TYPE` | hip (default) |
@@ -44,6 +57,17 @@ TP、pipeline parallel、MTP、DFlash2、2048 token 超の長文は未対応。
 | `--top-k N` | keep the N highest logits (default 0 = disabled) |
 | `--seed N` | sampling seed (default 0) |
 | `--moe-host-experts N` | routed experts per layer kept in host memory (default 0) |
+| `--moe-cache-swap-budget N` | expert cache swap budget (default 96) |
+| `--moe-cache-min-gain N` | minimum frequency gain to swap (default 150) |
+| `--moe-cache-rebalance-steps N` | rebalance interval in steps (default 4) |
+| `--moe-cache-rebalance-routes N` | rebalance interval in routes (0 = auto) |
+| `--moe-cache-decay N` | halve expert frequency at this count (default 4096) |
+| `--moe-cache-log-interval N` | expert cache hit-rate log interval (default 64) |
+| `--moe-cache-oracle 0\|1` | log cache oracle decisions (default 0) |
+| `--ple-artifact 0\|1` | write/read <model_dir>/quanted_ple.bin (default 1) |
+| `--ple-stream-io MODE` | pread \| mmap \| direct (default mmap) |
+| `--ple-hot-cache-gib N` | pinned host block cache for PLE; 0 = full resident (default 0) |
+| `--lm-head-int8 0\|1` | quantize the BF16 lm head to INT8 W32 on load (default 1) |
 | `--pcie-frac F` | share of PCIe the runtime may use (default 0.25) |
 | `--pcie-gbps F` | assumed PCIe bandwidth in GB/s (default 25) |
 | `--dflash2-model-dir PATH` | DFlash2 draft model directory; enables speculative decoding (greedy / stochastic) |
@@ -108,7 +132,7 @@ scratch と session pool の領域（DFlash2 は `--max-concurrent-requests` 分
 `--working-set-reserve-gib` の予約量である。`KV budget` は arena 残量から導出した
 physical KV capacity、`prefix cache` は capture slot の実サイズである
 （checkpoint 本体は pinned host memory に置くため arena を使わない）。
-`left` は arena の未使用容量であり、workspace はこの後に executor が実際に確保する。
+`left` は prefix cache の確保後に測定した arena の未使用容量である。
 テンソル並列では rank ごとに同じ表を `MEMORY_PLAN mode=auto tp=N rank=R` の見出しで
 出す。`target weights` はその rank が private weight（target の embed / lm_head など）を
 load した場合はそれを含むため、`KV budget` が rank 間で異なることがある。
@@ -215,11 +239,9 @@ drafter ring は target の KV dtype と独立して BF16 のままである。s
 `prefix_cache_checkpoint_position`（`0` のみ受理）と `temperature > 0` を
 DFlash2 経路でも受け付ける。
 stdio serving の DFlash2 verify は単一 request でも既定で lossy chunk を使い、
-非投機 greedy と生成列が一致しない場合がある。`SHELF_GDN_VERIFY_CHUNKED=0` で
-serial verify に戻せる。`SHELF_GDN_VERIFY_CHUNKED_EXACT=1` は exact chunk を選ぶが、
-非投機との bit 一致を保証しない。単発 decoder は serial のままである。
-`--dflash2-adaptive` は投機を自動で停止・再試行する実験的な方式で、投機を停止する batch 負荷の
-上限は `SHELF_DFLASH2_POLICY_MAX_SESSIONS` で上書きできる（既定 12）。
+非投機 greedy と生成列が一致しない場合がある。serial verify への切替や
+`--dflash2-adaptive` の上限上書きなど、DFlash2 関連の環境変数は
+[env_vars.md](env_vars.md#5-dflash2-投機デコード) を参照。単発 decoder は serial のままである。
 
 stdio serving の prefill 行数、環境変数、追加メモリは
 [server の DFlash2 設定](server.md#dflash2-speculative-decoding)を参照。
@@ -264,14 +286,17 @@ DFlash2 経路でも prefix cache を使う。
 
 `--serve-stdio` も同じ runtime の TP 経路を使う。TP2 の serve 性能は未計測であり、
 性能値は [../perf/current.md](../perf/current.md)、数値互換性・対応範囲の契約は
-[../developer/tensor_parallel_execution.md](../developer/tensor_parallel_execution.md)
+[../developer/multi-gpu.md](../developer/multi-gpu.md)
 を参照。
 
 ### pipeline parallel
 
-`--pipeline-parallel K` で model の layer を K stage に分割し、stage ごとに GPU を
-割り当てる。`--device` は stage 数と同じ個数を指定する（例 `--device 0,1`）。
-`--tensor-parallel` は `1` でなければならない。
+`--pipeline-parallel K` で model の layer を K stage に分割する。`--device` は
+`pipeline_parallel * expert_parallel * tensor_parallel` 個を指定する。
+GPU の並びは PP → EP → TP の順で解釈し、8 GPU で PP=2 / EP=2 / TP=2 なら
+`0,1` が PP0/EP0、`2,3` が PP0/EP1、`4,5` が PP1/EP0、`6,7` が PP1/EP1 になる。
+K128 一括セットを要求する量子化方式では、各 TP グループの後ろの rank に
+重みを多く割り当てる設計だが、現状は未配線である。
 
 ```bash
 ./build/shelf-compute --model-dir /opt/zen/work/models/Qwen3.8-27B-FP8 \
@@ -285,13 +310,18 @@ DFlash2 経路でも prefix cache を使う。
 - stage 間の hidden は bf16 のまま pinned host 経由で直列に受け渡す。
 - `--pipeline-parallel` は prefix cache、DFlash2、MTP、hidden taps、
   `--dump-logits` と併用できない。grouped expert checkpoint（Qwen3.6-35B-A3B MoE）も受理する
-  （layer を stage で割り、担当外 layer の expert 平面は読まない）。`--tensor-parallel` と
-  `--pipeline-parallel` を同時に 2 にはできない。
+  （layer を stage で割り、担当外 layer の expert 平面は読まない）。
+- pipeline stage 内の EP / TP 展開は実装済みである。MoE の routed expert は EP、
+  backbone と shared expert は TP で分割し、TP reduce の後に EP reduce を行う。
+  EP=2 / 4、EP=2 + TP=2 で生成列が TP=2 と一致することを確認済み。
+  dense model は EP で分割せず、EP グループごとに同じ計算を複製する。
+- `qwen4_exp` の PP + TP 併用は 2048 token の prefill で non-finite になる
+  既知の問題がある。PP 単体と短いプロンプトだけを確認している。
 - decode と prefill が同じ batch に混在する実行は未対応である。
   `--max-concurrent-requests 1` で運用するか、phase ごとに batch が分かれる条件で使う。
 - KV の page 数は stage 0 の auto-fit 結果を全 stage で共有する。
 
-契約の詳細は [../developer/pipeline_parallel.md](../developer/pipeline_parallel.md)
+契約の詳細は [../developer/multi-gpu.md](../developer/multi-gpu.md)
 を参照。
 
 ## serve-stdio
@@ -388,7 +418,7 @@ stdoutは `KEY=VALUE` 行。推論結果は以下:
 ```text
 PROMPT_TOKENS=<prompt token数>
 GENERATED_TOKENS=<生成token数>
-KV_CACHE_DTYPE=bf16 | fp8
+KV_CACHE_DTYPE=bf16 | fp8 | octave:...
 KV_POOL_RESERVED_BYTES=<KV pool予約バイト数>
 GENERATED_IDS=<id1>,<id2>,...
 ```
@@ -429,8 +459,14 @@ mask を次のように送る。
 ```
 
 次の mask を受け取るまでその request はスケジュールされない。他の request は
-進行できる。完了、cancel 後の mask は無視される。制約付き request は通常 decode を
-使い、DFlash2 / MTP による投機は行わない。
+進行できる。完了、cancel 後の mask は無視される。
+
+DFlash2 が有効な場合、制約付き request は通常 decode へ退避せず DFlash2 投機 decode で
+動作する。draft 生成後に `{"event":"draft","request_id":1,"round_id":1,"draft_tokens":[...]}`
+を返し、クライアントは `{"op":"draft_masks","request_id":1,"round_id":1,"valid_prefix":N,"bitmasks":[...]}`
+で `valid_prefix + 1` 行分の bitmask を返す。DFlash2 経路で出力される `token` event には
+`"need_mask":false` が付き、単一行 `mask` コマンドの送信は不要である。MTP 有効時は
+引き続き通常 decode へフォールバックする。
 
 R9700 の PLaMo 3 Translate BF16 の短文日→英（23 token、greedy）では、
 0.8B / 2B / 8B の prefill は 24.7 / 40.9 / 109.0 ms、decode は

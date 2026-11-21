@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
     config.page_tokens = static_cast<uint32_t>(opt.page_tokens);
     config.devices = opt.devices;
     config.tp = static_cast<uint32_t>(opt.tp);
+    config.expert_parallel = static_cast<uint32_t>(opt.expert_parallel);
     if (opt.mtp && opt.tp > 1) {
         config.private_target_weights = true;
         config.private_target_lm_head = opt.mtp;
@@ -190,6 +191,12 @@ int main(int argc, char** argv) {
     std::vector<int32_t> prompt_ids;
     if (opt.serve_stdio) {
         config.max_num_batched_tokens = static_cast<uint32_t>(opt.max_num_batched_tokens);
+        if (opt.prefill_chunk_set) {
+            const uint32_t chunk = static_cast<uint32_t>(opt.prefill_chunk);
+            if (config.max_num_batched_tokens > chunk) {
+                config.max_num_batched_tokens = chunk;
+            }
+        }
         if (config.max_num_batched_tokens < config.max_concurrent_requests) {
             config.max_num_batched_tokens = config.max_concurrent_requests;
         }
@@ -254,7 +261,10 @@ int main(int argc, char** argv) {
                     static_cast<uint32_t>(dflash_config.target_layer_ids[t]);
             }
         } else {
-            unsigned long rows = std::max<unsigned long>(prompt_ids.size() + 1UL, 16UL);
+            const unsigned long chunk = std::max<unsigned long>(opt.prefill_chunk, 16UL);
+            unsigned long rows =
+                std::min<unsigned long>(prompt_ids.size() + 1UL, chunk);
+            rows = std::max<unsigned long>(rows, 16UL);
             if (opt.mtp) {
                 rows = std::max<unsigned long>(rows, opt.mtp_drafts + 1UL);
             }

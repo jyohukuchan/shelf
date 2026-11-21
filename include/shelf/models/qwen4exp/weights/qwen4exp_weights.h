@@ -3,6 +3,7 @@
 #include <shelf/core/memory/arena.h>
 #include <shelf/core/memory/tensor.h>
 #include <shelf/core/status.h>
+#include <shelf/models/common/qwen_hybrid/stage_range.h>
 #include <shelf/models/qwen4exp/model/qwen4exp_config.h>
 #include <shelf/weights/matrix_weight.h>
 #include <shelf/weights/pinned_host_arena.h>
@@ -199,6 +200,10 @@ inline shelf::weights::Exl3LinearShape mtp_exl3_linear_shape(
 struct Qwen4ExpLoadOptions {
     std::uint32_t tp_size = 1;
     std::uint32_t tp_rank = 0;
+    // Routed experts follow the expert-parallel rank; the backbone still follows tp.
+    std::uint32_t ep_size = 0;
+    std::uint32_t ep_rank = 0;
+    bool ep_enabled = false;
     bool verify_quantized_payload_crc = false;
     // Text-only is the first target. MTP and Vision are not loaded by this path.
     bool load_mtp = false;
@@ -209,16 +214,21 @@ struct Qwen4ExpLoadOptions {
     // Routed experts kept in pinned host memory per layer. 0 keeps every expert in VRAM.
     // The remaining local experts stay in VRAM and are addressed by the slot map.
     std::uint32_t moe_host_experts = 0;
+    // Quantize the BF16 lm head to INT8 W32 while loading. Disabled by SHELF_LM_HEAD_INT8=0.
+    bool quantize_lm_head_int8_w32 = true;
+    // A pipeline stage loads only its own layer range. Embedding and final mixer / LM head
+    // follow the first / last rule. A stage combined with an expert-axis rank is not wired.
+    shelf::qwen_hybrid::PipelineStage stage;
 };
 
 // Logical checkpoint names this rank asks the HF reader for. Exposed for tests and for
 // the memory plan; the list excludes the PLE n-gram table itself, which is not in the
 // safetensors index.
-std::vector<std::string> qwen4exp_rank_logical_names(const Qwen4ExpTextConfig& config,
-                                                     std::uint32_t tp_size,
-                                                     std::uint32_t tp_rank,
-                                                     bool load_mtp = false,
-                                                     bool mtp_only = false);
+std::vector<std::string> qwen4exp_rank_logical_names(
+    const Qwen4ExpTextConfig& config, std::uint32_t tp_size, std::uint32_t tp_rank,
+    bool load_mtp = false, bool mtp_only = false,
+    const shelf::qwen_hybrid::PipelineStage& stage = {},
+    std::uint32_t ep_size = 0u, std::uint32_t ep_rank = 0u);
 
 // Loads one tensor-parallel rank of a Qwen4Exp checkpoint. Routed experts are split on
 // the expert axis. The canonical partition contract does not split EXL3 matrices yet, so
@@ -234,7 +244,13 @@ Result<Qwen4ExpRankWeights> load_qwen4exp_rank(const std::string& model_dir,
 Status validate_qwen4exp_rank(const Qwen4ExpRankWeights& weights,
                               const Qwen4ExpTextConfig& config,
                               std::uint32_t tp_size,
-                              std::uint32_t tp_rank);
+                              std::uint32_t tp_rank,
+                              std::uint32_t ep_size = 0u,
+                              std::uint32_t ep_rank = 0u);
+
+Status validate_qwen4exp_stage(const Qwen4ExpRankWeights& weights,
+                               const Qwen4ExpTextConfig& config,
+                               const shelf::qwen_hybrid::PipelineStage& stage);
 
 }  // namespace qwen4exp
 }  // namespace shelf

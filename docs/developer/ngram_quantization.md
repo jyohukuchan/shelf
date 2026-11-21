@@ -1,14 +1,15 @@
 # N-gram table 量子化形式
 
-N-gram / Engram / PLE 埋め込み table の保存形式を定義する。
+N-gram / Engram / PLE 埋め込み table のモデル非依存の保存形式を定義する。
+Qwen3.8-Flash-Next、Hy4-Flash、DeepSeek-V4.1-Flash などの同等の table 構造を対象とする。
+Qwen3.8-Flash-Next の PLE は本形式を直接読み込み、head ごとの行を復号する。
 既存の線形重み用 `shelf_quantization.json` とは別の形式である。
-
-Hy4-flash は `--engram-dir` の `ngram_manifest.json` を検出すると、この形式を読み込む。
-4 層の各 16 head を個別の table として指定する。`layer` は 1、11、21、31、
-`head` は 0〜15、`ngram_order` は head 0〜7 で 2、8〜15 で 3 とする。
-各 table の `dim` は 96、`rows` は checkpoint の対応する head の語彙数に一致させる。
-`ngram4`、`ngram5`、`mixed` に対応し、RDMA ソースとの組み合わせは拒否する。
-manifest が存在しない場合は従来の FP8 形式を読み込む。
+Hy4-flash は `--engram-dir` の `ngram_manifest.json` を検出すると本形式を読み込む。
+4 層の各 16 head を指定し、`ngram4`、`ngram5`、`mixed` に対応する。RDMA ソースとの組み合わせは拒否する。
+manifest が存在しない場合は FP8 形式を読み込む。
+評価の経緯は [offline 評価](../research/20261121/ngram_q_offline_eval.md)、
+[Hy4 評価](../research/20261121/ngram_q_step2_hy4.md)、
+[PopQA 生成評価](../research/20261121/ngram_q_step3_popqa_gen.md) を参照する。
 
 ## プロファイル
 
@@ -112,7 +113,5 @@ loader は使用前に manifest、参照先、全 tensor の内容を検証し�
 
 変換・検査には `tools/quantize/ngram_quantize.py` の `convert` / `verify` を使う。
 `--tensor-spec` は `name`, `layer`, `ngram_order`, `head` を持つオブジェクトの JSON 配列、
-`--bits-map` は tensor 名から bit 幅への JSON オブジェクトを指定する。自動検出では
-layer を名前から取得し、次数と head はそれぞれ 1 と 0 に設定するため、実際の構造を
-識別する必要がある場合は `--tensor-spec` で明示する。Python には NumPy、実行時には
+`--bits-map` は tensor 名から bit 幅への JSON オブジェクトを指定する。`--model-family auto|hy4|qwen4exp` は config と原本 tensor の構造から layer、次数、head を決定する。Hy4 の連結 table と Qwen の shard は head ごとに分割する。ほかの構造は `--tensor-spec` で明示する。Python には NumPy、実行時には
 `shelf_ngram_quant_c` 共有ライブラリが必要である。

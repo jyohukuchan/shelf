@@ -1,6 +1,8 @@
 #pragma once
 
 #include <shelf/core/memory/arena.h>
+#include <shelf/core/memory/gpu_memory_manager.h>
+#include <shelf/runtime/parallel/parallel_topology.h>
 #include <shelf/models/common/qwen_hybrid/weight_loader.h>
 #include <shelf/runtime/dflash2_config.h>
 #include <shelf/models/common/qwen_hybrid/tensor_parallel_context.h>
@@ -87,16 +89,23 @@ struct TpRankRuntimeConfig {
     MtpBatchReserveFn mtp_reserve;
     std::uint32_t tp_size = 1;
     std::uint32_t tp_rank = 0;
+    std::uint32_t ep_size = 1;
+    std::uint32_t ep_rank = 0;
+    bool ep_enabled = false;
+    ExpertPartitionMode expert_partition = ExpertPartitionMode::Replicated;
     int device_id = 0;
     std::uint32_t max_batch_rows = 0;
     std::uint32_t max_scheduled_requests = 0;
     std::uint32_t max_scheduled_output_rows = 0;
     std::uint32_t max_seq_len = 16;
     std::uint32_t page_tokens = 16;
+    std::uint32_t pipeline_hidden_width = 0;
     KVCacheDType kv_cache_dtype = KVCacheDType::BF16;
     ::shelf::kernel::OctaveKVCacheFormat octave_kv_format{};
-    std::size_t arena_bytes = 16ull * 1024ull * 1024ull * 1024ull;
+    gpu::GpuArena* arena = nullptr;
+    hipStream_t stream = nullptr;
     std::size_t working_set_reserve_bytes = 0;
+    std::uint32_t kv_pool_pages = 0;
     const DFlash2Config* drafter_config = nullptr;
     std::size_t drafter_weights_bytes = 0;
     std::uint32_t drafter_drafts = 0;
@@ -143,7 +152,7 @@ public:
 
     int device_id() const noexcept { return device_id_; }
     hipStream_t stream() const noexcept { return stream_; }
-    gpu::GpuArena& arena() { return arena_.value(); }
+    gpu::GpuArena& arena() { return *arena_; }
     // The rank's model, which owns the weights and states the rank's local geometry.
     const shelf::models::TpRankModel* rank_model() const;
     // The dense family's model. Null for a model whose FFN runs on grouped expert rows.
@@ -169,7 +178,7 @@ private:
 
     int device_id_ = -1;
     hipStream_t stream_ = nullptr;
-    std::optional<gpu::GpuArena> arena_;
+    gpu::GpuArena* arena_ = nullptr;
     std::unique_ptr<shelf::models::TpRankModel> model_;
     std::optional<SequenceSlotPool> seq_pool_;
     std::optional<GdnStatePool> gdn_pool_;
@@ -196,15 +205,22 @@ struct TpCoordinatorConfig {
     TpRankModelPrefetch prefetch_rank_model = nullptr;
     TpRankModelRelease release_rank_model = nullptr;
     std::vector<int> devices;
+    // The mesh inside one pipeline stage: expert_parallel groups of tensor_parallel ranks.
+    // tensor_parallel == 0 uses the whole device list as one TP group (EP=1).
+    std::uint32_t pipeline_rank = 0;
+    std::uint32_t tensor_parallel = 0;
+    std::uint32_t expert_parallel = 1;
     std::uint32_t max_batch_rows = 0;
     std::uint32_t max_scheduled_requests = 0;
     std::uint32_t max_scheduled_output_rows = 0;
     std::uint32_t max_seq_len = 16;
     std::uint32_t page_tokens = 16;
+    std::uint32_t pipeline_hidden_width = 0;
     KVCacheDType kv_cache_dtype = KVCacheDType::BF16;
     ::shelf::kernel::OctaveKVCacheFormat octave_kv_format{};
-    std::size_t arena_bytes = 16ull * 1024ull * 1024ull * 1024ull;
+    gpu::GpuMemoryManager* memory = nullptr;
     std::size_t working_set_reserve_bytes = 0;
+    std::uint32_t kv_pool_pages = 0;
     const DFlash2Config* drafter_config = nullptr;
     std::size_t drafter_weights_bytes = 0;
     std::uint32_t drafter_drafts = 0;
@@ -289,8 +305,19 @@ private:
 
     std::vector<int> devices_;
     std::vector<std::unique_ptr<TpRankRuntime>> ranks_;
-    std::unique_ptr<::shelf::runtime::TpTransport> transport_;
-    std::unique_ptr<::shelf::runtime::TpBarrierGroup> barrier_group_;
+
+    struct ReduceGroup {
+        std::vector<int> devices;
+        std::unique_ptr<::shelf::runtime::TpTransport> transport;
+        std::unique_ptr<::shelf::runtime::TpBarrierGroup> barrier;
+    };
+
+    std::optional<ParallelTopology> topology_;
+    std::vector<ReduceGroup> tp_groups_;
+    // One EP group per TP lane: a TP rank keeps its lane and only its EP coordinate
+    // varies. Every rank reaches an EP barrier exactly once per collective.
+    std::vector<ReduceGroup> ep_groups_;
+    bool explicit_ep_ = false;
     std::vector<std::unique_ptr<Worker>> workers_;
     std::unordered_map<std::uint64_t, MirrorSequences> mirrors_;
 };

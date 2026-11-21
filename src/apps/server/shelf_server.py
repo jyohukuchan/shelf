@@ -107,6 +107,8 @@ def build_compute_argv(opts) -> list[str]:
         "--prefix-cache-strategy", opts.prefix_cache_strategy,
         "--prefix-cache-save-interval", str(opts.prefix_cache_save_interval),
     ]
+    if opts.prefill_chunk is not None:
+        argv += ["--prefill-chunk", str(opts.prefill_chunk)]
     if opts.dflash2_model_dir:
         argv += [
             "--dflash2-model-dir", opts.dflash2_model_dir,
@@ -125,14 +127,22 @@ def build_compute_argv(opts) -> list[str]:
         argv += ["--mtp", "--mtp-drafts", str(opts.mtp_drafts)]
     if opts.tensor_parallel > 1:
         argv += ["--tensor-parallel", str(opts.tensor_parallel)]
+    if opts.expert_parallel > 1:
+        argv += ["--expert-parallel", str(opts.expert_parallel)]
+    if opts.pipeline_parallel > 1:
+        argv += ["--pipeline-parallel", str(opts.pipeline_parallel)]
     if opts.moe_host_experts is not None:
         argv += ["--moe-host-experts", str(opts.moe_host_experts)]
+    if opts.lm_head_int8 is not None:
+        argv += ["--lm-head-int8", str(opts.lm_head_int8)]
     if opts.pcie_frac is not None:
         argv += ["--pcie-frac", str(opts.pcie_frac)]
     if opts.pcie_gbps is not None:
         argv += ["--pcie-gbps", str(opts.pcie_gbps)]
     if opts.ple_prefetch is not None:
         argv += ["--ple-prefetch", str(opts.ple_prefetch)]
+    if opts.ple_hot_cache_gib is not None:
+        argv += ["--ple-hot-cache-gib", str(opts.ple_hot_cache_gib)]
     if opts.tp_transport is not None:
         argv += ["--tp-transport", opts.tp_transport]
     if opts.verify_weights:
@@ -522,9 +532,12 @@ def parse_args(argv=None):
 
     parser.add_argument("--max-seq-len", type=int, default=None,
                         help="max sequence length (default 32768; PLaMo 3: 2048)")
-    parser.add_argument("--max-num-batched-tokens", type=int, default=2048,
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096,
                         help="token budget per scheduled step; also sets the executor "
-                             "row bucket (default 2048)")
+                             "row bucket (default 4096)")
+    parser.add_argument("--prefill-chunk", type=int, default=4096,
+                        help="cap prefill tokens per step and the executor row bucket "
+                             "(default 4096)")
     parser.add_argument("--max-concurrent-requests", type=int, default=4,
                         help="max in-flight requests (default 4)")
 
@@ -547,6 +560,11 @@ def parse_args(argv=None):
                              "count must match --tensor-parallel (default 0)")
     parser.add_argument("--tensor-parallel", type=int, default=1, choices=(1, 2),
                         help="tensor parallel size forwarded to compute (default 1)")
+    parser.add_argument("--expert-parallel", type=int, default=1, choices=(1, 2, 4),
+                        help="expert parallel size forwarded to compute (default 1)")
+    parser.add_argument("--pipeline-parallel", type=int, default=1, choices=(1, 2, 4),
+                        help="pipeline parallel size forwarded to compute "
+                             "(mutually exclusive with --tensor-parallel; default 1)")
     parser.add_argument("--kv-cache-dtype", default="bf16",
                         type=kv_cache_dtype_value,
                         help="KV cache dtype (default bf16)")
@@ -575,7 +593,7 @@ def parse_args(argv=None):
     parser.add_argument("--dflash2-tree-budget", type=tree_budget_value, default=None,
                         metavar="N|auto",
                         help="tree verify rows: auto uses 10 for one decoding request if speculative, "
-                             "8 otherwise (default auto; 0 disables)")
+                             "8 otherwise (default 0; 0 disables)")
     parser.add_argument("--dflash2-adaptive", action="store_true",
                         help="batch と受理数に応じて投機を制御する")
     parser.add_argument("--dflash2-max-sessions", type=int, default=0,
@@ -593,12 +611,16 @@ def parse_args(argv=None):
 
     parser.add_argument("--moe-host-experts", type=int, default=None,
                         help="層あたり host に退避する routed expert 数（default 0）")
+    parser.add_argument("--lm-head-int8", type=int, default=None, choices=(0, 1),
+                        help="lm head を load 時に INT8 W32 へ量子化する（default 1）")
     parser.add_argument("--pcie-frac", type=float, default=None,
                         help="runtime が使ってよい PCIe の割合（default 0.25）")
     parser.add_argument("--pcie-gbps", type=float, default=None,
                         help="想定する PCIe 帯域 GB/s（default 25）")
     parser.add_argument("--ple-prefetch", type=int, default=None, choices=(0, 1),
                         help="prefill 中に次の PLE 行を先読みする（default 1）")
+    parser.add_argument("--ple-hot-cache-gib", type=int, default=None,
+                        help="PLE の pinned host ブロックキャッシュ容量 GiB（default 0 = 全量常駐）")
     parser.add_argument("--tp-transport", default=None,
                         help="tensor parallel transport の選択")
     parser.add_argument("--verify-weights", action="store_true",
@@ -608,18 +630,27 @@ def parse_args(argv=None):
     devices = [part.strip() for part in opts.device.split(",") if part.strip()]
     if not devices or any(not device.isdigit() for device in devices):
         parser.error(f"bad --device: {opts.device}")
-    if len(devices) != opts.tensor_parallel:
-        parser.error(f"--device expects {opts.tensor_parallel} entries for "
+    parallel_width = (opts.pipeline_parallel * opts.expert_parallel *
+                      opts.tensor_parallel)
+    if len(devices) != parallel_width:
+        parser.error(f"--device expects {parallel_width} entries for "
+                     f"--pipeline-parallel {opts.pipeline_parallel} * "
+                     f"--expert-parallel {opts.expert_parallel} * "
                      f"--tensor-parallel {opts.tensor_parallel}, "
                      f"got {len(devices)}")
     if len(set(devices)) != len(devices):
         parser.error(f"--device entries must be unique: {opts.device}")
     opts.device = ",".join(devices)
 
+    if opts.pipeline_parallel > 1 and opts.prefix_cache:
+        parser.error("--pipeline-parallel does not support prefix cache")
+
     if opts.max_seq_len is not None and opts.max_seq_len < 1:
         parser.error("--max-seq-len must be >= 1")
     if not 16 <= opts.max_num_batched_tokens <= 8192:
         parser.error("--max-num-batched-tokens must be between 16 and 8192")
+    if opts.prefill_chunk is not None and not 16 <= opts.prefill_chunk <= 8192:
+        parser.error("--prefill-chunk must be between 16 and 8192")
     if opts.max_concurrent_requests < 1:
         parser.error("--max-concurrent-requests must be >= 1")
     if opts.inference_budget_tokens < 1:
@@ -635,12 +666,7 @@ def parse_args(argv=None):
     if opts.dflash2_adaptive and not opts.dflash2_model_dir:
         parser.error("--dflash2-adaptive requires --dflash2-model-dir")
     if opts.dflash2_tree_budget is None:
-        if opts.dflash2_model_dir and (opts.dflash2_drafts != 7 or opts.tensor_parallel != 1):
-            print("warning: automatic tree budget requires TP=1 and 7 drafts; using chain",
-                  file=sys.stderr, flush=True)
-            opts.dflash2_tree_budget = 0
-        else:
-            opts.dflash2_tree_budget = "auto"
+        opts.dflash2_tree_budget = 0
     if opts.dflash2_tree_budget != "auto" and not 0 <= opts.dflash2_tree_budget <= 512:
         parser.error("--dflash2-tree-budget must be between 0 and 512")
     if opts.dflash2_tree_budget not in (0, "auto") and not opts.dflash2_model_dir:
@@ -806,6 +832,8 @@ async def _serve(opts) -> int:
         "arena_gib": opts.arena_gib,
         "device": opts.device,
         "tensor_parallel": opts.tensor_parallel,
+        "expert_parallel": opts.expert_parallel,
+        "pipeline_parallel": opts.pipeline_parallel,
         "kv_cache_dtype": opts.kv_cache_dtype,
         "working_set_reserve_gib": opts.working_set_reserve_gib,
         "prefix_cache_strategy": opts.prefix_cache_strategy,
@@ -851,7 +879,7 @@ async def _serve(opts) -> int:
                  f"checkpoints={opts.prefix_cache_checkpoints}, "
                  f"save_interval={opts.prefix_cache_save_interval}, "
                  f"capabilities.prefix_cache="
-                 f"{str(compute.capabilities.prefix_cache).lower()}"))
+                 f"{str(compute.capabilities.prefix_cache).lower()})"))
     if opts.dflash2_model_dir:
         _log(_banner("Speculative:", f"DFlash2 ({opts.dflash2_drafts} drafts)"))
         _log(_banner("Draft model:", Path(opts.dflash2_model_dir).name))

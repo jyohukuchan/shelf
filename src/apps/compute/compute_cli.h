@@ -23,8 +23,11 @@ struct ComputeOptions {
     unsigned long page_tokens = 16;
     unsigned long max_concurrent_requests = 4;
     unsigned long max_num_batched_tokens = 2048;
+    unsigned long prefill_chunk = 512;
+    bool prefill_chunk_set = false;
     std::vector<int> devices = {0};
     unsigned long tp = 1;
+    unsigned long expert_parallel = 1;
     unsigned long pipeline_parallel = 1;
     std::string kv_cache_dtype = "bf16";
     shelf::runtime::DecodeBackend decode_backend =

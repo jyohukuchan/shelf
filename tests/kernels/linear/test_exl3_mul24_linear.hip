@@ -1,7 +1,6 @@
 #include <shelf/kernels/fused/exl3/rotate_out.h>
 #include <shelf/kernels/fused/exl3/rotate_quantize.h>
 #include <shelf/inference/execution/exl3_dense_gemm.h>
-#include <shelf/kernels/optimized/linear/exl3_mul1.h>
 #include <shelf/kernels/optimized/linear/exl3_mul24.h>
 #include <shelf/quantization/exl3/exl3_int8.h>
 #include <shelf/core/memory/types.h>
@@ -261,6 +260,7 @@ bool run_case(uint32_t rows, uint32_t n, uint32_t k, uint32_t bits, uint32_t see
             std::printf("  dense int8 GEMM: no hipBLASLt algorithm for this shape, skipped\n");
         } else {
             HIP_OK(ge);
+            HIP_OK(shelf::execution::exl3_dense_gemm_int8(rows, n, k, d_dense.p, d_codes.p, d_acc.p, nullptr));
             HIP_OK(shelf::kernel::launch_exl3_mul24_gemm(d_codes_f.p, d_scales_f.p, code_stride, scale_stride_bytes,
                                                        d_trellis.p, bits, d_y2.p, cap, n, k, 1u, nullptr, d_count.p));
             HIP_OK(shelf::kernel::launch_exl3_mul24_rotate_out_i32(

@@ -175,7 +175,7 @@ shard ごとの `pread` に変更した。
 - 既定は 20 MiB の mmap window（64 Ki 行）で読み、AVX512 で量子化する。
 - window を `madvise(MADV_DONTNEED)` + `munmap` し、`posix_fadvise(DONTNEED)` で
   page cache も落とす。
-- `SHELF_PLE_STREAM_IO=pread|mmap|direct` で切り替える。`direct` は `O_DIRECT` を使い、
+- `--ple-stream-io pread|mmap|direct` で切り替える。`direct` は `O_DIRECT` を使い、
   page cache を経由しない。
 - BF16 table 全体を anonymous RAM にも page cache にも保持しない。残るのは INT6 出力
   38.743 GiB と worker あたり約 20 MiB の window だけである。
@@ -191,6 +191,31 @@ shard ごとの `pread` に変更した。
 wall は disk 帯域で決まり、方式差は 1 s 未満だった。mmap window は pread より sys が
 小さく、O_DIRECT を要求しないため既定にした。O_DIRECT は opt-in とし、io_uring は
 依存を増やさないため使っていない。
+
+## 量子化済み artifact
+
+初回のオンライン量子化が完了したら、`<model_dir>/quanted_ple.bin` に INT6 table を
+書く。2 回目以降は header の geometry と source shard の size / mtime fingerprint が
+一致する場合、その artifact を読んで量子化を省略する。
+
+- artifact: 8,192 B header + 128 shard × 4,096 B 境界の payload。
+- 実ファイル: 41,600,684,376 B（38.743 GiB）。
+- source fingerprint: PLE shard を含む safetensors file の `st_size` と `st_mtim`。
+- stale / invalid / 途中で切れた artifact は再量子化して上書きする。
+- `--ple-artifact 0` で artifact の読み書きを無効にできる。
+- 書き込みは temp file + `rename` で atomic。`fdatasync` は 8 shard ごとに行い、
+  page cache の dirty を約 2.6 GiB に抑える。書き込み失敗は model load を失敗させない。
+
+`test_qwen4exp_load --skip-gpu ...`:
+
+| 状態 | wall | user | sys | peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| 初回（量子化 + artifact 書き込み） | 52.08 s | 21.6 s | 31.4 s | 未測定 |
+| 2 回目（artifact 読み込み） | **15.04 s** | **0.67 s** | 20.68 s | **38.93 GiB** |
+
+artifact 読み込みは 95.37 GiB の BF16 を読まず、38.743 GiB の INT6 table だけを読む。
+量子化の CPU も不要になる。初回は artifact 書き込みが加わるため 52 s かかるが、
+2 回目以降は 15 s になる。
 
 ## 起動時間
 

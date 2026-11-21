@@ -3,7 +3,6 @@
 
 #include <shelf/inference/execution/exl3_dispatch_decision.h>
 #include <shelf/kernels/optimized/linear/exl3_family/types.h>
-#include <shelf/kernels/optimized/linear/exl3_mul1.h>
 #include <shelf/kernels/optimized/linear/exl3_mul24.h>
 
 #include <cstdint>
@@ -33,12 +32,15 @@ int main() {
     check("min row exact", exl3_mul24_use_dense(true, 256u, 256u, 1ull << 20));
     check("decode rows", !exl3_mul24_use_dense(true, 16u, 256u, 1ull << 20));
     check("dense disabled", !exl3_mul24_use_dense(true, 2048u, 0xFFFFFFFFu, 1ull << 20));
+    check("A disabled for decode or verify", !shelf::execution::exl3_mul24_use_a_prefill(true, 0u));
+    check("A enabled for prefill", shelf::execution::exl3_mul24_use_a_prefill(true, 1u));
+    check("B remains selected for prefill", !shelf::execution::exl3_mul24_use_a_prefill(false, 1u));
 
     // The decision struct keeps the independent axes and has no fallback by default.
     shelf::execution::Exl3DispatchDecision d;
     check("default direct", d.backend == shelf::kernel::exl3_detail::Exl3Backend::Direct);
     check("default no reason", d.fallback_reason == nullptr);
-    check("default mul1", d.codebook == shelf::kernel::Exl3Codebook::Mul1);
+    check("default mul24", d.codebook == shelf::kernel::Exl3Codebook::Mul24);
     check("default decode", d.phase == shelf::kernel::Exl3Phase::Decode);
 
     if (g_failures == 0) {

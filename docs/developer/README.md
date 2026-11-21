@@ -3,15 +3,15 @@
 現在実装されている architecture / runtime / server / kernel contract のみを置く。
 過去の PoC・Gate・採否判断は Git history、現在の性能値は `docs/perf/` を参照。
 
-## ゴールと roadmap
+## roadmap
 
-- [objective.md](objective.md) — 現行のゴールと性能目標
 - [roadmap.md](roadmap.md) — 今後の作業予定
 
 ## architecture / runtime
 
 - [architecture.md](architecture.md) — layer 構成と依存ルール、Server を含む責務境界
 - [runtime.md](runtime.md) — execution path と state ownership
+- [multi-gpu.md](multi-gpu.md) — PP / EP / TP の座標、所有構造、collective、比較条件
 - [qwen35.md](qwen35.md) — Qwen3.5 runtime family の配線（source path / KernelId / execution order）
 - [qwen35moe.md](qwen35moe.md) — Qwen3.5 MoE の config と routed expert weight 集約 contract
 - [qwen35qsa.md](qwen35qsa.md) — Qwen3.5 QSA（`qwen3_5_qsa`）の indexer / block mask contract
@@ -30,7 +30,7 @@
 ## quantization / formats
 
 - [quantization.md](quantization.md) — 量子化フォーマットと offline pipeline の overview
-- [tensor_parallel_execution.md](tensor_parallel_execution.md) — Qwen3.8 Dense の Tensor Parallel execution（rank-local runtime / collective / transport）
+- [ngram_quantization.md](ngram_quantization.md) — Ngram4 / Ngram5 table の形式契約
 - [canonical_soa_payload.md](canonical_soa_payload.md) — canonical payload の binary/layout 仕様
 - [tensor_partition.md](tensor_partition.md) — TP tensor partition と canonical → partition → preshuffle の weight materialization contract
 

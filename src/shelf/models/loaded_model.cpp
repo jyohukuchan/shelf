@@ -8,6 +8,7 @@
 #include <shelf/models/qwen35moe/runtime/executor_footprint.h>
 #include <shelf/models/qwen4exp/model/lower_to_primitives.h>
 #include <shelf/models/qwen4exp/runtime/executor_footprint.h>
+#include <shelf/models/qwen4exp/weights/ple_table.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -83,6 +84,10 @@ Result<LoadedModel> LoadedModel::load(
         if (const char* host_experts = std::getenv("SHELF_MOE_HOST_EXPERTS")) {
             load_options.moe_host_experts =
                 static_cast<std::uint32_t>(std::strtoul(host_experts, nullptr, 10));
+        }
+        if (const char* lm_head_int8 = std::getenv("SHELF_LM_HEAD_INT8")) {
+            load_options.quantize_lm_head_int8_w32 =
+                std::strtoul(lm_head_int8, nullptr, 10) != 0u;
         }
         auto loaded = shelf::qwen4exp::Qwen4ExpModel::load_from_safetensors(
             model_dir, 1u, 0u, arena, stream, load_options);
@@ -190,6 +195,16 @@ std::uint64_t LoadedModel::host_pinned_bytes() const noexcept {
     return 0u;
 }
 
+HostMemoryBytes LoadedModel::host_memory_bytes() const noexcept {
+    HostMemoryBytes out;
+    out.embedding = host_pinned_bytes();
+    if (qwen4exp_ != nullptr) {
+        out.offload_experts = qwen4exp_->weights().host_expert_bytes();
+        if (ple_table_ != nullptr) out.ple_table = ple_table_->host_bytes();
+    }
+    return out;
+}
+
 std::size_t LoadedModel::executor_reserve_bytes(std::size_t max_batch_rows,
                                                 std::size_t max_scheduled_requests,
                                                 std::size_t max_scheduled_output_rows,
@@ -232,6 +247,16 @@ std::size_t LoadedModel::executor_reserve_bytes(std::size_t max_batch_rows,
     if (moe_ != nullptr)
         total += shelf::qwen35moe::moe_executor_grouped_bytes(moe_->text_config(),
                                                               max_batch_rows, tp_size);
+    if (qwen4exp_ != nullptr) {
+        const auto& text = qwen4exp_->text_config();
+        shelf::qwen35moe::Qwen35MoeTextConfig grouped;
+        static_cast<shelf::qwen_hybrid::QwenHybridConfig&>(grouped) = text;
+        grouped.ffn.num_experts = text.ffn.num_experts;
+        grouped.ffn.num_experts_per_tok = text.ffn.num_experts_per_tok;
+        grouped.ffn.moe_intermediate_size = text.ffn.moe_intermediate_size;
+        grouped.ffn.shared_expert_intermediate_size = text.ffn.shared_expert_intermediate_size;
+        total += shelf::qwen35moe::moe_executor_grouped_bytes(grouped, max_batch_rows, tp_size);
+    }
     return total;
 }
 
@@ -280,6 +305,7 @@ Result<shelf::qwen35::Executor> LoadedModel::create_executor(
     }
     if (qwen4exp_ != nullptr) {
         auto ple_table = shelf::models::get_qwen4exp_ple_table(model_dir_);
+        ple_table_ = ple_table;
         auto created = shelf::models::create_qwen4exp_model_executor(
             *qwen4exp_, ple_table, sequence_pool, gdn_state_pool, kv_pool, arena, config);
         if (created.ok() && moe_cache_ != nullptr) {

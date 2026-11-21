@@ -224,6 +224,10 @@ struct ExecutorConfig {
     // Empty retains the legacy single-table profile and theta.
     std::vector<EffectiveRopeProfile> rope_profiles;
     ::shelf::qwen_hybrid::PipelineStage stage;
+    // Width of the hidden a pipeline stage receives and emits. 0 uses the model's own
+    // hidden size. A family whose stage boundary carries a wider stream (Qwen4Exp's
+    // hyper-connection stack) states it here so the transfer buffers are sized for it.
+    std::uint32_t pipeline_hidden_width = 0;
     bool emit_normed_token_hidden = false;
     bool external_hidden_input = false;
     // 0 means the family's hidden size. Qwen4Exp's MTP block consumes the pre-mixer wide
@@ -303,6 +307,7 @@ struct GraphCacheSlot {
     uint32_t attention_plan_key = 0;
     uint8_t exec_role = 0;
     uint8_t has_spec_history = 0;
+    uint8_t has_token_bitmask = 0;
     uint32_t capture_rows = 0;
     const void* gdn_conv_history = nullptr;
     const void* gdn_recurrent_history = nullptr;
@@ -346,6 +351,19 @@ struct Executor {
     SequenceSlotPool* sequence_pool = nullptr;
     GdnStatePool* gdn_state_pool = nullptr;
     PagedKVPool* kv_pool = nullptr;
+    void bind_kv_pool(PagedKVPool& pool) {
+        kv_pool = &pool;
+        auto ms = host_model_state;
+        if (pool.dtype() == KVCacheDType::FP8_E4M3) {
+            ms.kv_fp8 = make_paged_kv_fp8_view(pool);
+        } else if (pool.dtype() == KVCacheDType::OCTAVE) {
+            ms.kv_octave = make_paged_kv_octave_view(pool);
+        } else {
+            ms.kv_bf16 = make_paged_kv_bf16_view(pool);
+        }
+        ms.kv_dtype = static_cast<uint32_t>(pool.dtype());
+        host_model_state = ms;
+    }
     bool uses_qsa_state = false;
     bool uses_ple_conv_state = false;
     std::unique_ptr<::shelf::state::QsaKeyStatePool> qsa_state_pool;
@@ -377,6 +395,8 @@ struct Executor {
     std::vector<::shelf::runtime::TpExecutionSchedule> tp_schedules;
     ::shelf::runtime::TpBarrierHook* tp_barrier = nullptr;
     int tp_rank = 0;
+    ::shelf::runtime::TpBarrierHook* ep_barrier = nullptr;
+    int ep_rank = 0;
     gpu::Tensor execution_status;
     gpu::Tensor execution_workspace;
     ::shelf::runtime::WeightSlot* host_weight_table = nullptr;
@@ -390,6 +410,7 @@ struct Executor {
     std::vector<ProgramStagingMeta> program_staging_meta;
     std::array<GraphCacheSlot, ::shelf::runtime::ProgramSet::kRowBucketCount> graph_cache{};
     std::array<GraphCacheSlot, 2> dflash_verify_graph_cache{};
+    uint32_t* graph_token_bitmask_staging = nullptr;
     void* host_token_graph_staging = nullptr;
     size_t host_token_graph_staging_bytes = 0;
     ::shelf::runtime::DeviceBatchContext* host_ctx_graph_staging = nullptr;

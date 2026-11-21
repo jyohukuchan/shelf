@@ -470,14 +470,15 @@ Status launch_program_run(
     if (!executor.tp_schedules.empty()) {
         if (program_index >= executor.tp_schedules.size() ||
             !executor.tp_schedules[program_index].active() ||
-            executor.tp_barrier == nullptr) {
+            (executor.tp_barrier == nullptr && executor.ep_barrier == nullptr)) {
             return Status::invalid_state(
                 "tp execution schedule is active but cannot be launched",
                 __FILE__, __LINE__);
         }
         run = runtime::execute_program_tp_ranges(
             program, ctx, stream, executor.tp_schedules[program_index],
-            executor.tp_barrier, executor.tp_rank);
+            executor.tp_barrier, executor.tp_rank,
+            executor.ep_barrier, executor.ep_rank);
     } else {
         run = runtime::execute_program_range(program, ctx, stream, 0u, dispatch_count);
     }
@@ -738,7 +739,8 @@ Result<PendingBatch> submit_co_batch(
             staging[i].sampling.sample_index = sampling.sample_index;
             staging[i].sampling.reserved[0] = 0u;
             uint32_t oc = req.num_output_rows ? req.num_output_rows : 1u;
-            staging[i].output_count = static_cast<uint8_t>(oc < 255u ? oc : 255u);
+            if (oc > 65535u) return Status::invalid_argument("too many output rows", __FILE__, __LINE__);
+            staging[i].output_count = static_cast<uint16_t>(oc);
             staging[i].output_index = output_count;
             output_count += oc;
             if (sampling.mode != runtime::SamplingMode::None) sampled_count += oc;
@@ -1038,7 +1040,6 @@ Result<PendingBatch> submit_co_batch(
                   exec_role == ::shelf::runtime::ExecutionRole::Decode)
                : ((R == 1u && N == 1u && exec_role == ::shelf::runtime::ExecutionRole::Decode) ||
                   verify_graph)) &&
-        !prep.has_token_bitmask &&
         executor.tp_schedules.empty() &&
         N > 0 &&
         graph_slot_idx >= 0 &&
@@ -1067,6 +1068,40 @@ Result<PendingBatch> submit_co_batch(
                 executor, *program, N, max_visible_tokens, attn_use_prefill,
                 attention_plan_key))
             graph_active = false;
+    }
+    if (graph_active && prep.has_token_bitmask) {
+        const size_t words = (static_cast<size_t>(executor.model.config->vocab_size) + 31u) / 32u;
+        for (uint32_t i = 0; i < R; ++i) {
+            const auto& sampling = staging[i].sampling;
+            if (sampling.token_bitmask != nullptr && sampling.token_bitmask_row_stride != 0u &&
+                sampling.token_bitmask_row_stride < words) {
+                shelf::gpu::discard_cleanup_result(hipEventDestroy(done));
+                return on_error(Status::invalid_argument("token bitmask row stride is too small", __FILE__, __LINE__));
+            }
+        }
+        if (executor.graph_token_bitmask_staging == nullptr) {
+            const hipError_t err = hipMalloc(&executor.graph_token_bitmask_staging,
+                words * executor.config.max_scheduled_output_rows * sizeof(uint32_t));
+            if (err != hipSuccess) {
+                shelf::gpu::discard_cleanup_result(hipEventDestroy(done));
+                return on_error(Status::hip_error("hipMalloc graph token bitmask", hipGetErrorString(err), __FILE__, __LINE__));
+            }
+        }
+        for (uint32_t i = 0; i < R; ++i) {
+            auto& sampling = staging[i].sampling;
+            if (sampling.token_bitmask == nullptr) continue;
+            uint32_t* dst = executor.graph_token_bitmask_staging + staging[i].output_index * words;
+            const size_t rows = sampling.token_bitmask_row_stride == 0u ? 1u : staging[i].output_count;
+            const size_t src_pitch = sampling.token_bitmask_row_stride == 0u ? words : sampling.token_bitmask_row_stride;
+            const hipError_t err = hipMemcpy2DAsync(dst, words * sizeof(uint32_t), sampling.token_bitmask,
+                src_pitch * sizeof(uint32_t), words * sizeof(uint32_t), rows, hipMemcpyDeviceToDevice, stream);
+            if (err != hipSuccess) {
+                shelf::gpu::discard_cleanup_result(hipEventDestroy(done));
+                return on_error(Status::hip_error("hipMemcpy2DAsync graph token bitmask", hipGetErrorString(err), __FILE__, __LINE__));
+            }
+            sampling.token_bitmask = dst;
+            if (sampling.token_bitmask_row_stride != 0u) sampling.token_bitmask_row_stride = static_cast<uint32_t>(words);
+        }
     }
     const uint8_t graph_exec_role = static_cast<uint8_t>(exec_role);
     const uint8_t graph_has_spec_history =
@@ -1174,6 +1209,7 @@ Result<PendingBatch> submit_co_batch(
                 gslot->attention_plan_key == attention_plan_key &&
                 gslot->exec_role == graph_exec_role &&
                 gslot->has_spec_history == graph_has_spec_history &&
+                gslot->has_token_bitmask == static_cast<uint8_t>(prep.has_token_bitmask) &&
                 gslot->capture_rows == graph_capture_rows &&
                 gslot->gdn_conv_history == graph_gdn_conv_history &&
                 gslot->gdn_recurrent_history == graph_gdn_recurrent_history &&
@@ -1247,6 +1283,7 @@ Result<PendingBatch> submit_co_batch(
                             gslot->attention_plan_key = attention_plan_key;
                             gslot->exec_role = graph_exec_role;
                             gslot->has_spec_history = graph_has_spec_history;
+                            gslot->has_token_bitmask = static_cast<uint8_t>(prep.has_token_bitmask);
                             gslot->capture_rows = graph_capture_rows;
                             gslot->gdn_conv_history = graph_gdn_conv_history;
                             gslot->gdn_recurrent_history = graph_gdn_recurrent_history;
@@ -1381,6 +1418,8 @@ Executor::Executor(Executor&& other) noexcept
       tp_schedules(std::move(other.tp_schedules)),
       tp_barrier(other.tp_barrier),
       tp_rank(other.tp_rank),
+      ep_barrier(other.ep_barrier),
+      ep_rank(other.ep_rank),
       execution_status(std::move(other.execution_status)),
       execution_workspace(std::move(other.execution_workspace)),
       host_weight_table(other.host_weight_table),
@@ -1394,6 +1433,7 @@ Executor::Executor(Executor&& other) noexcept
       program_staging_meta(std::move(other.program_staging_meta)),
       graph_cache(other.graph_cache),
       dflash_verify_graph_cache(other.dflash_verify_graph_cache),
+      graph_token_bitmask_staging(other.graph_token_bitmask_staging),
       host_token_graph_staging(other.host_token_graph_staging),
       host_token_graph_staging_bytes(other.host_token_graph_staging_bytes),
       host_ctx_graph_staging(other.host_ctx_graph_staging),
@@ -1454,6 +1494,7 @@ Executor::Executor(Executor&& other) noexcept
     other.program_staging_meta.clear();
     other.graph_cache = {};
     other.dflash_verify_graph_cache = {};
+    other.graph_token_bitmask_staging = nullptr;
     other.host_token_graph_staging = nullptr;
     other.host_token_graph_staging_bytes = 0;
     other.host_ctx_graph_staging = nullptr;
@@ -1533,6 +1574,10 @@ Executor& Executor::operator=(Executor&& other) noexcept {
         other.tp_barrier = nullptr;
         tp_rank = other.tp_rank;
         other.tp_rank = 0;
+        ep_barrier = other.ep_barrier;
+        other.ep_barrier = nullptr;
+        ep_rank = other.ep_rank;
+        other.ep_rank = 0;
         host_weight_table = other.host_weight_table;
         other.host_weight_table = nullptr;
         host_parameter_table = other.host_parameter_table;
@@ -1551,6 +1596,7 @@ Executor& Executor::operator=(Executor&& other) noexcept {
         other.program_staging_meta.clear();
         graph_cache = other.graph_cache;
         dflash_verify_graph_cache = other.dflash_verify_graph_cache;
+        graph_token_bitmask_staging = other.graph_token_bitmask_staging;
         host_token_graph_staging = other.host_token_graph_staging;
         host_token_graph_staging_bytes = other.host_token_graph_staging_bytes;
         host_ctx_graph_staging = other.host_ctx_graph_staging;
@@ -1601,6 +1647,7 @@ Executor& Executor::operator=(Executor&& other) noexcept {
         other.host_dispatch_staging = nullptr;
         other.graph_cache = {};
         other.dflash_verify_graph_cache = {};
+        other.graph_token_bitmask_staging = nullptr;
         other.host_token_graph_staging = nullptr;
         other.host_token_graph_staging_bytes = 0;
         other.host_ctx_graph_staging = nullptr;
@@ -1643,7 +1690,7 @@ Executor& Executor::operator=(Executor&& other) noexcept {
 
 bool Executor::is_shutdown() const noexcept {
     return host_request_staging == nullptr && host_pending_staging == nullptr &&
-           batch_context == nullptr &&
+           batch_context == nullptr && graph_token_bitmask_staging == nullptr &&
            batch_context_storage.device_struct.allocation_base() == nullptr;
 }
 
@@ -1739,6 +1786,12 @@ Status executor_shutdown(Executor& ex) noexcept {
         }
     }
 #endif
+    if (ex.graph_token_bitmask_staging != nullptr) {
+        const hipError_t err = hipFree(ex.graph_token_bitmask_staging);
+        if (first_error.ok() && err != hipSuccess)
+            first_error = Status::hip_error("hipFree graph_token_bitmask_staging", hipGetErrorString(err), __FILE__, __LINE__);
+        ex.graph_token_bitmask_staging = nullptr;
+    }
     if (ex.host_token_graph_staging != nullptr) {
         hipError_t err = hipHostFree(ex.host_token_graph_staging);
         if (first_error.ok() && err != hipSuccess) {
@@ -1928,8 +1981,7 @@ std::vector<LayerOverrideSource> read_layer_override_sources(uint32_t hidden) {
 
 bool program_needs_exl3_workspace(const ::shelf::runtime::Program& program) noexcept {
     for (const ::shelf::runtime::DispatchBinding& binding : program.dispatches) {
-        if (binding.kernel_id == ::shelf::runtime::KernelId::LINEAR_EXL3_W16A16 ||
-            binding.kernel_id == ::shelf::runtime::KernelId::LINEAR_EXL3_INT8) return true;
+        if (binding.kernel_id == ::shelf::runtime::KernelId::LINEAR_EXL3_INT8) return true;
     }
     return false;
 }
@@ -2065,6 +2117,8 @@ Result<Executor> create_executor(
         if (!status.ok()) return status;
     }
     const std::size_t H = tc.hidden_size;
+    const std::size_t H_pipeline =
+        config.pipeline_hidden_width != 0u ? config.pipeline_hidden_width : H;
     const std::size_t V = tc.vocab_size;
     const uint32_t N = config.max_batch_rows;
     const uint32_t R = config.max_scheduled_requests;
@@ -2102,11 +2156,13 @@ Result<Executor> create_executor(
     if (!st.ok()) return st;
 
     if (!first_stage) {
-        st = allocate_contiguous_tensor<bf16_t>(arena, {Npad, H}, ex.pipeline_input_hidden);
+        st = allocate_contiguous_tensor<bf16_t>(arena, {Npad, H_pipeline},
+                                                ex.pipeline_input_hidden);
         if (!st.ok()) return st;
     }
     if (!last_stage) {
-        st = allocate_contiguous_tensor<bf16_t>(arena, {Npad, H}, ex.pipeline_output_hidden);
+        st = allocate_contiguous_tensor<bf16_t>(arena, {Npad, H_pipeline},
+                                                ex.pipeline_output_hidden);
         if (!st.ok()) return st;
     }
 
@@ -2338,7 +2394,7 @@ Result<Executor> create_executor(
             opts.validate_workspace = true;
             opts.max_token_rows = Npad;
             opts.max_output_rows = MO;
-            if (const char* nwr = std::getenv("PSQ_NO_WORKSPACE_REUSE")) {
+            if (const char* nwr = std::getenv("SHELF_NO_WORKSPACE_REUSE")) {
                 if (nwr[0] != '\0') opts.no_workspace_reuse = true;
             }
             ::shelf::runtime::StaticParameterTableView pview;
@@ -2381,11 +2437,16 @@ Result<Executor> create_executor(
                     "PLE conv state layer count does not match the lowered program",
                     __FILE__, __LINE__);
 
-            if (config.tp != nullptr && config.tp->tp_size > 1) {
+            if (config.tp != nullptr &&
+                (config.tp->tp_size > 1 || config.tp->ep_enabled)) {
                 ex.tp_schedules.reserve(::shelf::runtime::ProgramSet::kRowBucketCount);
                 for (const auto& prog : built_set.programs) {
                     auto schedule_res =
-                        ::shelf::runtime::build_tp_execution_schedule(lowered_graph, prog);
+                        ::shelf::runtime::build_tp_execution_schedule(
+                            lowered_graph, prog,
+                            config.tp != nullptr ? config.tp->tp_size : 1u,
+                            config.tp != nullptr ? config.tp->ep_size : 1u,
+                            config.tp != nullptr && config.tp->ep_enabled);
                     if (!schedule_res.ok()) {
                         shelf::gpu::discard_cleanup_result(hipStreamDestroy(upload_stream));
                         return schedule_res.status();

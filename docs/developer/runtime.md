@@ -88,7 +88,25 @@ shelf::qwen35::execute_batch(executor, batch, stream)
 `PrefixCache` は非所有ポインタ参照である（`set_prefix_cache` で渡し、
 所有権は compute アプリに残す）。
 destroy順序は app が決定的に管理（executor shutdown → `PrefixCache::shutdown` →
-arena shutdown）。`PrefixCache::shutdown` は必ず arena より前に実行する。
+coordinator/executor の破棄 → `GpuMemoryManager::shutdown`）。
+`PrefixCache::shutdown` は必ず arena より前に実行する。
+
+## GpuMemoryManager
+
+`GpuMemoryManager` は physical device ごとに 1 つの `GpuArena` と 1 つの
+`hipStream_t` を所有し、PP / EP / TP の実行者へ貸し出す。実行者は arena も stream も
+生成も破棄もしない。
+
+- `GpuMemoryManager::create(devices, capacity_bytes)` が全 device の arena と stream を
+  まとめて生成する。`capacity_bytes == 0` は device ごとの空き VRAM から 0.5 GiB を
+  引いた auto。
+- `arena_for(device)` / `stream_for(device)` は所有権を移さないハンドルを返す。
+- `shutdown()` は stream → arena の順で全リソースを解放し、最初の失敗を返す。
+- `TpRankRuntime` / `TpCoordinator` / `PipelineStageRuntime` /
+  `PipelineParallelCoordinator` は config で受け取った arena / stream / manager だけを使う。
+  `GpuArena::create()` と `hipStreamCreate()` は `GpuMemoryManager` だけが呼ぶ。
+- manager は coordinator と executor より長生きしなければならない。
+  compute は全 executor / coordinator を破棄した後に `shutdown()` を呼ぶ。
 
 ## GpuArena
 
@@ -105,9 +123,10 @@ allocationのlifetimeを追跡しないため）。
 
 ### arena budget
 
-`Qwen35RuntimeConfig::arena_bytes == 0` は auto である。compute は `hipMemGetInfo`
-を model load 前に 1 回呼び、空き VRAM から 0.5 GiB を引いた値を arena の容量に
-する。TP でも rank ごとに別の値を問い合わせず、この容量を全 rank が使う。
+`Qwen35RuntimeConfig::arena_bytes == 0` は auto である。compute は起動時に
+`GpuMemoryManager` を作り、manager が device ごとに `hipMemGetInfo` を 1 回呼んで
+空き VRAM から 0.5 GiB を引いた値を arena の容量にする。同じ容量が PP / TP の
+全 stage / rank に貸し出される（device ごとの空きが違えば容量も違う）。
 
 起動時 plan は stderr にだけ出す（`--serve-stdio` の stdout を汚さない）。
 
@@ -122,7 +141,7 @@ MEMORY_PLAN mode=auto
   required          target + draft + drafter runtime + workspace + KV + prefix
   available         起動時の空き VRAM（fixed では arena capacity）
   arena capacity    reserved virtual address
-  left              arena capacity - required
+  left              確保完了後の arena 未使用容量
 ```
 
 `draft weights` は arena からの予約であり、serve 時に drafter を load する
@@ -138,11 +157,11 @@ MEMORY_PLAN tp drafter: weights xx.xx GiB scratch xx.xx GiB session slot xx.xx G
 DFLASH2_WEIGHT_ARENA_BYTES=<bytes>
 ```
 
-`MEMORY_PLAN` の `left` は executor が workspace を確保する前の値である。
-plan 後に必要になる作業領域は `--working-set-reserve-gib` が受け持つため、
-drafter 分を織り込んでも reserve を 1 GiB まで下げると executor 確保で不足する。
-reserve は plan 時点の約束であり、実際の作業領域を超えた場合は plan ではなく
-後続の arena 確保で `insufficient memory` として現れる。
+`MEMORY_PLAN` の `left` は prefix cache の確保後に測定した arena の未使用容量である。
+`required` は表示した項目の合計であり、slot/GDN pool の arena 確保は行ごとに示さない。
+executor の workspace は KV の容量を決める前に確保済みなので、予約量を重複して差し引かない。
+prefix cache の capture slot に必要な GDN / QSA / PLE state は executor 生成後に確定するため、
+その時点で見積もりを更新してから KV の容量を決める。
 
 executor が arena から確保する量は起動時に 1 行で出す。
 
@@ -238,21 +257,34 @@ drafter の scratch・session pool・MTP batch の予約、`runtime workspace` �
 capture slot である。checkpoint は host memory に置かれるため arena を消費しない。
 rank 間で private weight が異なるため、`KV budget` も rank ごとに違ってよい。
 
-arena 外の page-locked host memory は、上の表とは別に 1 ブロックで出す。
+arena 外の host memory は、上の表とは別に 1 ブロックで出す。
 
 ```text
 MEMORY_PLAN host memory tp=2
   embedding rank 0    0.52 GiB
   embedding rank 1    0.52 GiB
+  PLE table           1.20 GiB
+  offload experts     9.30 GiB
   prefix checkpoint   1.79 GiB
-  total               2.83 GiB
+  total              13.33 GiB
 ```
 
 `embedding` は rank ごとの語彙 shard を pinned host RAM に置いた量である
 （tied embedding のモデルでは 0。量子化 checkpoint と BF16 checkpoint のどちらも
-pinned host に置く）。`prefix checkpoint` は prefix cache が保持する
-checkpoint の全 rank 分で、`MEMORY_PLAN host memory` の `total` は両者の合計である。
+pinned host に置く）。`PLE table` は `qwen4_exp` の ngram embedding テーブルで、
+プロセス内で 1 つだけ共有するため rank ごとに重複計上しない。
+`--ple-hot-cache-gib` を指定した場合は Hot ブロックキャッシュの実バイトを出し、
+Cold 側の mmap 領域はここには含まれない。`offload experts`
+は `--moe-host-experts` で VRAM から host へ移した冷たい routed expert の plane で、
+rank ごとの合計を出す。`prefix checkpoint` は prefix cache が保持する
+checkpoint の全 rank 分で、`MEMORY_PLAN host memory` の `total` はこれら全項目の合計である。
 pipeline parallel では `MEMORY_PLAN host memory pipeline=N` の見出しで stage ごとに出す。
+
+配置が VRAM 側の項目は `MEMORY_PLAN mode=auto` の表に含まれる。`target weights` は
+weight load 直後の arena 使用量なので、offload と一緒に作られる `expert_slot_map` や
+`expert_route_freq` のような GPU 上のテンソルもここに計上される。host へ移した
+expert plane は arena を消費しないため `target weights` には入らず、上の
+`offload experts` にのみ表示される。
 
 ## Scheduler
 

@@ -2,6 +2,7 @@
 
 #include <shelf/core/status.h>
 #include <shelf/models/common/qwen_hybrid/lowered_primitives.h>
+#include <shelf/models/common/qwen_hybrid/stage_range.h>
 #include <shelf/models/qwen4exp/model/qwen4exp_config.h>
 #include <shelf/models/qwen4exp/weights/qwen4exp_weights.h>
 
@@ -17,6 +18,9 @@ struct Qwen4ExpLowerOptions {
     std::uint32_t max_context_tokens = 512;
     std::uint32_t tp_size = 1;
     std::uint32_t tp_rank = 0;
+    std::uint32_t ep_size = 1;
+    std::uint32_t ep_rank = 0;
+    bool ep_enabled = false;
     float rope_attention_factor = 1.0f;
     // Target layers whose completed output, averaged over the hyper-connection streams,
     // is exposed as a DFlash2 target feature. Appended after the head's four outputs.
@@ -24,6 +28,7 @@ struct Qwen4ExpLowerOptions {
     // Expose the pre-mixer wide residual (hc * hidden) after the hidden taps. The MTP
     // drafter consumes it; the Qwen4Exp trunk has no separate post-norm hidden.
     bool expose_wide_hidden = false;
+    shelf::qwen_hybrid::PipelineStage stage;
 };
 
 // Lowers one loaded rank: embedding repeated into the hc stream stack, every decoder layer

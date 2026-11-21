@@ -92,7 +92,7 @@ public:
 
     std::size_t ffn_workspace_reserve_bytes(std::size_t max_batch_rows) const override {
         return qmoe::moe_executor_grouped_bytes(model_.text_config(), max_batch_rows,
-                                                context_.tp_size);
+                                                context_.tp_size, context_.ep_size);
     }
 
     bool uses_exl3_linear() const override { return qmoe::uses_exl3_linear(model_.weights()); }
@@ -164,18 +164,27 @@ struct Qwen4ExpStatePoolLayouts {
 };
 
 Qwen4ExpStatePoolLayouts qwen4exp_state_pool_layouts(
-    const qwen4exp::Qwen4ExpTextConfig& cfg, std::uint32_t max_context_tokens) {
+    const qwen4exp::Qwen4ExpTextConfig& cfg, std::uint32_t max_context_tokens,
+    const qhy::PipelineStage& stage = {}) {
     const auto counts = qhy::count_layer_topology(cfg);
+    std::uint32_t attention_layers = counts.attention_layers;
+    std::uint32_t ple_layers = static_cast<std::uint32_t>(cfg.ple.layer_ids.size());
+    if (stage.enabled) {
+        attention_layers = 0u;
+        ple_layers = 0u;
+        for (std::uint32_t layer = stage.layer_lo(); layer < stage.layer_hi(); ++layer) {
+            if (!qhy::layer_is_gdn(cfg, layer)) ++attention_layers;
+            if (cfg.layer_has_ple(layer)) ++ple_layers;
+        }
+    }
     Qwen4ExpStatePoolLayouts layouts;
-    layouts.uses_qsa = counts.attention_layers != 0u;
+    layouts.uses_qsa = attention_layers != 0u;
     if (layouts.uses_qsa) {
         const std::uint32_t ratio = static_cast<std::uint32_t>(cfg.indexer.compress_ratio);
         const std::uint32_t blocks = (max_context_tokens + ratio - 1u) / ratio;
         layouts.qsa = ::shelf::state::QsaKeyStatePoolLayout::make(
-            static_cast<std::uint32_t>(counts.attention_layers),
-            ::shelf::kernel::kQsaHeadDim, ratio, blocks);
+            attention_layers, ::shelf::kernel::kQsaHeadDim, ratio, blocks);
     }
-    const std::uint32_t ple_layers = static_cast<std::uint32_t>(cfg.ple.layer_ids.size());
     layouts.uses_ple_conv = ple_layers != 0u;
     if (layouts.uses_ple_conv) {
         layouts.ple_conv = ::shelf::state::PleConvStatePoolLayout::make(
@@ -246,8 +255,14 @@ public:
         return total;
     }
 
-    std::uint64_t host_pinned_bytes() const override {
+    std::uint64_t host_pinned_bytes() const override { return 0u; }
+
+    std::uint64_t host_offload_expert_bytes() const override {
         return model_.weights().host_expert_bytes();
+    }
+
+    std::uint64_t host_ple_table_bytes() const override {
+        return ple_table_ != nullptr ? ple_table_->host_bytes() : 0u;
     }
 
     std::size_t token_row_ffn_size() const override {
@@ -409,10 +424,14 @@ Result<q35::Executor> create_qwen4exp_model_executor(
         config.max_context_tokens != 0u ? config.max_context_tokens : 512u;
     options.tp_size = config.tp != nullptr ? config.tp->tp_size : 1u;
     options.tp_rank = config.tp != nullptr ? config.tp->tp_rank : 0u;
+    options.ep_size = config.tp != nullptr ? config.tp->ep_size : 1u;
+    options.ep_rank = config.tp != nullptr ? config.tp->ep_rank : 0u;
+    options.ep_enabled = config.tp != nullptr && config.tp->ep_enabled;
     options.rope_attention_factor = static_cast<float>(config.rope_profile.attention_factor);
     options.hidden_taps = std::span<const std::uint32_t>(
         config.target_hidden_taps.data(), config.target_hidden_tap_count);
     options.expose_wide_hidden = config.emit_normed_token_hidden;
+    options.stage = config.stage;
     auto lowered = qwen4exp::lower_qwen4exp_to_primitives(cfg, model.weights(), options);
     if (!lowered.ok()) return lowered.status();
 
@@ -420,7 +439,8 @@ Result<q35::Executor> create_qwen4exp_model_executor(
     input.model.config = &cfg;
     input.model.embed_tokens = &model.weights().embed_tokens;
     input.lowered = lowered.release();
-    const auto state_layouts = qwen4exp_state_pool_layouts(cfg, options.max_context_tokens);
+    const auto state_layouts =
+        qwen4exp_state_pool_layouts(cfg, options.max_context_tokens, options.stage);
     input.uses_qsa_state = state_layouts.uses_qsa;
     input.qsa_layers = state_layouts.qsa.num_qsa_states;
     input.qsa_head_dim = state_layouts.qsa.head_dim;
@@ -472,11 +492,18 @@ Result<q35::Executor> create_moe_model_executor(
     const q35::ExecutorConfig& config) {
     std::uint32_t tp_size = 1u;
     std::uint32_t tp_rank = 0u;
+    std::uint32_t ep_size = 1u;
+    std::uint32_t ep_rank = 0u;
+    bool ep_enabled = false;
     if (config.tp != nullptr) {
         tp_size = config.tp->tp_size;
         tp_rank = config.tp->tp_rank;
+        ep_size = config.tp->ep_size;
+        ep_rank = config.tp->ep_rank;
+        ep_enabled = config.tp->ep_enabled;
     }
-    if (tp_size > 1u && config.tp->global_num_experts == 0u) {
+    if ((tp_size > 1u || ep_size > 1u) && config.tp != nullptr &&
+        config.tp->global_num_experts == 0u) {
         return Status::unsupported(
             "a model with grouped experts needs a tensor parallel context that states its "
             "expert range: the expert planes are not part of the matrix partition contract",
@@ -498,6 +525,9 @@ Result<q35::Executor> create_moe_model_executor(
     lower_options.emit_normed_token_hidden = config.emit_normed_token_hidden;
     lower_options.tp_size = tp_size;
     lower_options.tp_rank = tp_rank;
+    lower_options.ep_size = ep_size;
+    lower_options.ep_rank = ep_rank;
+    lower_options.ep_enabled = ep_enabled;
     lower_options.stage = config.stage;
 
     auto lowered = qmoe::lower_qwen35_moe_to_primitives(model.text_config(), model.weights(),
@@ -520,13 +550,20 @@ Result<std::unique_ptr<TpRankModel>> build_qwen4exp_tp_rank_model(
     const auto& cfg = text_config.value();
     qwen4exp::Qwen4ExpLoadOptions load_options;
     load_options.load_mtp = config.load_mtp_layers;
+    load_options.ep_size = config.ep_size;
+    load_options.ep_rank = config.ep_rank;
+    load_options.ep_enabled = config.ep_enabled;
     if (const char* host_experts = std::getenv("SHELF_MOE_HOST_EXPERTS")) {
         load_options.moe_host_experts =
             static_cast<std::uint32_t>(std::strtoul(host_experts, nullptr, 10));
     }
+    if (const char* lm_head_int8 = std::getenv("SHELF_LM_HEAD_INT8")) {
+        load_options.quantize_lm_head_int8_w32 =
+            std::strtoul(lm_head_int8, nullptr, 10) != 0u;
+    }
     auto model = qwen4exp::Qwen4ExpModel::load_from_safetensors(
         config.model_dir, config.tp_size, config.tp_rank, arena, stream,
-        load_options);
+        load_options, config.ep_size, config.ep_rank);
     if (!model.ok()) return model.status();
 
     qhy::TensorParallelContext context;
@@ -542,15 +579,18 @@ Result<std::unique_ptr<TpRankModel>> build_qwen4exp_tp_rank_model(
         static_cast<std::uint32_t>(cfg.linear_num_value_heads / config.tp_size);
     context.local_vocab_size = static_cast<std::uint32_t>(cfg.vocab_size);
     context.vocab_parallel_lm_head = false;
+    context.ep_size = config.ep_size;
+    context.ep_rank = config.ep_rank;
+    context.ep_enabled = config.ep_enabled;
     context.global_num_experts = static_cast<std::uint32_t>(cfg.ffn.num_experts);
-    if (config.tp_size == 0u ||
-        (cfg.ffn.num_experts % config.tp_size) != 0u) {
-        return Status::unsupported("Qwen4Exp experts must divide by tp_size", __FILE__,
+    if (config.ep_size == 0u || config.ep_rank >= config.ep_size ||
+        (cfg.ffn.num_experts % config.ep_size) != 0u) {
+        return Status::unsupported("Qwen4Exp experts must divide by ep_size", __FILE__,
                                    __LINE__);
     }
     context.local_num_experts =
-        static_cast<std::uint32_t>(cfg.ffn.num_experts / config.tp_size);
-    context.expert_begin = config.tp_rank * context.local_num_experts;
+        static_cast<std::uint32_t>(cfg.ffn.num_experts / config.ep_size);
+    context.expert_begin = config.ep_rank * context.local_num_experts;
     context.local_shared_expert_intermediate_size =
         static_cast<std::uint32_t>(cfg.ffn.shared_expert_intermediate_size);
 
@@ -586,6 +626,9 @@ Result<std::unique_ptr<TpRankModel>> build_moe_tp_rank_model(
     static_cast<qhy::HybridLoadOptions&>(load_options) =
         static_cast<const qhy::HybridLoadOptions&>(config.load_options);
     load_options.load_mtp_layers = config.load_mtp_layers;
+    load_options.ep_size = config.ep_size;
+    load_options.ep_rank = config.ep_rank;
+    load_options.ep_enabled = config.ep_enabled;
     // The plan outlives the load: the loader keeps a pointer to it, so it cannot be a
     // temporary inside the branch.
     std::optional<weights::TensorPartitionPlan> plan;
@@ -601,9 +644,9 @@ Result<std::unique_ptr<TpRankModel>> build_moe_tp_rank_model(
                                                                     stream, load_options);
     if (!model_result.ok()) return model_result.status();
 
-    auto context_result = qmoe::make_qwen35moe_tensor_parallel_context(text_config,
-                                                                       config.tp_size,
-                                                                       config.tp_rank, false);
+    auto context_result = qmoe::make_qwen35moe_tensor_parallel_context(
+        text_config, config.tp_size, config.tp_rank, config.ep_size, config.ep_rank,
+        config.ep_enabled, false);
     if (!context_result.ok()) return context_result.status();
 
     return std::unique_ptr<TpRankModel>(
@@ -742,9 +785,10 @@ Result<std::unique_ptr<TpRankModel>> build_qwen35qsa_tp_rank_model(
     const q35r::TpRankRuntimeConfig& config, gpu::GpuArena& arena, hipStream_t stream) {
     auto text_config = qwen35qsa::read_qwen35qsa_text_config(config.model_dir);
     if (!text_config.ok()) return text_config.status();
+    qwen35qsa::Qwen35QsaLoadOptions load_options(config.load_options);
+    load_options.stage = config.pipeline_stage;
     auto model = qwen35qsa::Qwen35QsaModel::load_tensor_parallel_from_safetensors(
-        config.model_dir, config.tp_size, config.tp_rank, arena, stream,
-        config.load_options);
+        config.model_dir, config.tp_size, config.tp_rank, arena, stream, load_options);
     if (!model.ok()) return model.status();
 
     auto context = q35::make_qwen35_tensor_parallel_context(

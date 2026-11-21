@@ -262,20 +262,23 @@ round-half-to-even ではない）。0.25 / 1.25 / 2.5 / 5 の境界で code が
 ## 6ter. EXL3 trellis（HF 由来、load-only）
 
 Shelf は EXL3 の canonical artifact を生成しない。HF checkpoint の 4 tensor を
-そのまま payload plane として manifest に載せ、byte 列を変換せず GPU へ転送する。
+そのまま payload plane として manifest に載せる。
 
 | role | tensor | dtype | shape |
 | --- | --- | --- | --- |
-| `codes` | `<prefix>.trellis` | I16 | `[k/16, n/16, 16*ka + (half ? 8 : 0)]` |
+| `codes` | `<prefix>.trellis` | I16 | `[k/16, n/16, 16*ka]` |
 | `suh` | `<prefix>.suh` | F16 | `[k]` |
 | `svh` | `<prefix>.svh` | F16 | `[n]` |
-| `marker` | `<prefix>.mul1` | I32 | scalar |
+| `marker` | `<prefix>.mul1` | I32 | scalar（`0x00DCD12D`） |
 
-- コードブックは mul1 固定。`ka` は 1..8、`half` は 1.5 / 2.5 / 3.5。
+- コードブックは mul24（EXL3-INT8、marker 値 `0x00DCD12D`）固定。`ka` は 1..8 の
+  整数 bit rate のみ受理する（half bit rate は不可）。
 - `k_padded == k`、`k` と `n` は 128 の倍数。
-- `preshuffled == false`。trellis は tile のまま常駐し、kernel が ring と codebook を
-  復号する。Hadamard は kernel 内で行う。
-- marker の値は kernel では使わない。
+- `preshuffled == false`。dense 重みの trellis はロード時に 16×16 タイル単位で
+  `[n/16, k/16]`（n-major）へ並べ替えて常駐し、MoE expert plane は `[k/16, n/16]` の
+  まま常駐する。codebook 復号と Hadamard は kernel 内で行う。
+- marker の値（`0x00DCD12D`）はロード時に検証し、一致しない checkpoint は
+  `Status::unsupported` で拒否する。kernel 自体は marker を参照しない。
 - EXL3 の unquantized tensor は BF16 entry とし、F16 で保存されている場合は load 時に
   BF16 へ widen する。
 
@@ -518,7 +521,7 @@ E8M0 の operand 側 fold（`d = row_ref[row] - e8m0[row][blk]` を E4M3 仮数�
 1.5 刻みを丸めるため値が変わるので、loader は行単位の E8M0 幅を検査して
 `row_ref_exact` を立て、dispatch はその flag が true の payload でのみ fold を使う。
 fold を使う variant は Prefill2D のみ（rows >= 512）。実測と判断は
-[../../research/20261103/mxfp4_gate_a_prime.md](../../research/20261103/mxfp4_gate_a_prime.md)。
+[../research/20261103/mxfp4_gate_a_prime.md](../research/20261103/mxfp4_gate_a_prime.md)。
 
 row_ref は 1 byte / output row であり、1 byte / weight でも 1 byte / block でもない。
 例: out=17408, k=5120 の MXFP4 weight で codes + E8M0 が約 45 MB に対し row_ref は
@@ -597,7 +600,7 @@ disk 上の canonical payload は global tensor のままで、rank-local partit
 load 時に行われ、その rank-local canonical の後に native preshuffle が実行される。
 native payload を disk contract にしない現在の方針を維持する。
 順序 contract は [tensor_partition.md](tensor_partition.md)、runtime execution は
-[tensor_parallel_execution.md](tensor_parallel_execution.md) を参照する。
+[multi-gpu.md](multi-gpu.md) を参照する。
 
 canonical disk format は **TP-independent** である。tensor parallel を使う場合も
 disk 上の canonical payload は global tensor のままで、rank-local partition は

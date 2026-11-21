@@ -1,5 +1,11 @@
 # Architecture
 
+## Toolchain と C++ ABI
+
+host の C++ と HIP は ROCm clang と libc++ のヘッダでビルドする。GCC と libstdc++ のヘッダは使わない。ROCm の C++ ライブラリが実行時に libstdc++ を読み込むため、その依存順を制御する。ROCm 10 以降は `SHELF_LOAD_LIBSTDCXX_FIRST` の既定値を ON とし、libstdc++ を libc++abi より前の直接依存として読み込む。ROCm 10 未満と版が不明な場合は OFF とする。既存の CMake cache の明示値は維持される。
+
+Tensile host が読み込まれている場合、hipBLASLt を使う前に RTTI と `__dynamic_cast` の束縛先を検査し、libstdc++ 以外に解決された場合は初期化エラーとして停止する。この設定を外した ROCm 10 系のビルドでは、hipBLASLt（`libhipblaslt.so.1`）の初期化中に、エラーメッセージなしで SIGSEGV する。libc++abi が先に束縛されると `dynamic_cast` が null を返し、`TensileLite::MasterSolutionLibrary::initLibraryMapping` が null の `this` で落ちる。落ちる場所が原因から離れているため、上記の検査が原因を名指しして止める。hipBLASLt 側で `dynamic_cast` の結果が検査されるようになり、libc++abi 先行でも初期化できると確認できた時点で、この回避策と検査は外せる。この検査は既知の衝突を検出するもので、混在するすべての C++ ABI の互換性を保証しない。C++ オブジェクトや例外を shelf と ROCm の API 境界で受け渡さない。
+
 ## Layer構成
 
 apps から下方向への依存のみ。矢印は「参照する」向きで、上位ほど具体的なモデル／実行編成、下位ほど汎用の仕組みを置く。
@@ -289,11 +295,11 @@ ContinuousBatcher (global 1個)
  Executor Executor
 ```
 
-詳細は [tensor_parallel_execution.md](tensor_parallel_execution.md) を参照。
+詳細は [multi-gpu.md](multi-gpu.md) を参照。
 
 Pipeline parallel は layer range を stage に分割し、hidden を pinned host 経由で
 直列に hand-off する。stage の選択は `shelf::models` が担う。
-current contract は [pipeline_parallel.md](pipeline_parallel.md) を参照。
+current contract は [multi-gpu.md](multi-gpu.md) を参照。
 
 ## Checkpoint識別（config identity gate）
 

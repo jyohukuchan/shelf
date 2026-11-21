@@ -2,10 +2,15 @@
 #include "private_target_weights.h"
 
 #include <shelf/core/memory/size_format.h>
+#include <shelf/inference/execution/gemm_lt.h>
+#include <shelf/inference/state/ple_conv_state_pool.h>
+#include <shelf/inference/state/qsa_state_pool.h>
 #include <shelf/runtime/execution/row_bucket.h>
 #include <shelf/models/common/qwen_hybrid/stage_range.h>
 #include <shelf/models/pipeline_stage_model.h>
+#include <shelf/models/tp_rank_model.h>
 #include <shelf/models/qwen35/model/gdn_state_layout.h>
+#include <shelf/models/qwen4exp/model/qwen4exp_config.h>
 #include <shelf/models/qwen35/runtime/dflash2_footprint.h>
 #include <shelf/models/qwen35/runtime/executor_footprint.h>
 #include <shelf/models/qwen35/runtime/mtp_drafter.h>
@@ -22,7 +27,6 @@ namespace app {
 
 namespace {
 
-constexpr std::size_t kAutoArenaMarginBytes = 512ull * 1024ull * 1024ull;
 constexpr std::size_t kAutoWorkspaceMinimumBytes = 128ull * 1024ull * 1024ull;
 
 uint32_t ceil_div(uint32_t a, uint32_t b) {
@@ -45,14 +49,17 @@ struct MemoryPlan {
     std::size_t prefix = 0;
     uint32_t kv_tokens = 0;
     bool prefix_enabled = false;
+    bool measured_left = false;
+    std::size_t left_bytes = 0;
 };
 
 void print_memory_plan(const MemoryPlan& plan, const char* scope = "") {
     const std::size_t required = plan.target_weights + plan.draft_weights +
         plan.drafter_runtime + plan.workspace + plan.kv + plan.prefix;
-    const std::size_t left = plan.arena_capacity > required
+    const std::size_t derived_left = plan.arena_capacity > required
         ? plan.arena_capacity - required
         : 0;
+    const std::size_t left = plan.measured_left ? plan.left_bytes : derived_left;
     fprintf(stderr,
             "MEMORY_PLAN mode=%s%s\n"
             "  target weights    %s\n"
@@ -82,9 +89,10 @@ void print_memory_plan(const MemoryPlan& plan, const char* scope = "") {
 }
 
 void print_host_memory(const std::vector<std::size_t>& embeddings,
+                       std::size_t ple_bytes, std::size_t offload_bytes,
                        std::size_t prefix_bytes, const char* scope = "",
                        const char* unit = "rank") {
-    std::size_t total = prefix_bytes;
+    std::size_t total = prefix_bytes + ple_bytes + offload_bytes;
     for (std::size_t bytes : embeddings) total += bytes;
     if (total == 0u) return;
     fprintf(stderr, "MEMORY_PLAN host memory%s\n", scope);
@@ -97,6 +105,13 @@ void print_host_memory(const std::vector<std::size_t>& embeddings,
             fprintf(stderr, "  embedding %s %zu     %s\n", unit, index,
                     gpu::format_gib(embeddings[index]).c_str());
         }
+    }
+    if (ple_bytes != 0u) {
+        fprintf(stderr, "  PLE table            %s\n", gpu::format_gib(ple_bytes).c_str());
+    }
+    if (offload_bytes != 0u) {
+        fprintf(stderr, "  offload experts      %s\n",
+                gpu::format_gib(offload_bytes).c_str());
     }
     if (prefix_bytes != 0u) {
         fprintf(stderr, "  prefix checkpoint    %s\n",
@@ -123,10 +138,6 @@ Qwen35ComputeRuntime::~Qwen35ComputeRuntime() noexcept {
         auto st = shutdown();
         (void)st;
     }
-    if (stream_ != nullptr) {
-        (void)hipStreamDestroy(stream_);
-        stream_ = nullptr;
-    }
 }
 
 Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
@@ -145,10 +156,6 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
         return Status::invalid_argument(
             "pipeline_parallel must be positive", __FILE__, __LINE__);
     }
-    if (config_.pipeline_parallel > 1 && config_.tp != 1) {
-        return Status::unsupported(
-            "pipeline parallel requires tp 1", __FILE__, __LINE__);
-    }
     if (config_.mtp &&
         config_.kv_cache_dtype == kernel::KVCacheDType::OCTAVE)
         std::fprintf(stderr,
@@ -164,10 +171,7 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
                 return Status::unsupported("plamo3: parallel and speculative execution are not supported", __FILE__, __LINE__);
         }
         if (family.value() == shelf::models::ModelFamily::Qwen4Exp) {
-            if (config_.tp < 2) {
-                return Status::unsupported(
-                    "Qwen4Exp requires --tensor-parallel 2 or 4", __FILE__, __LINE__);
-            }
+            config_.dflash2_host_token_ids = true;
             // The Qwen4Exp rank already holds a complete replicated lm_head / embedding, so
             // the drafter borrows those instead of loading a second private copy.
             config_.private_target_weights = false;
@@ -187,18 +191,24 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
     if (hipGetDeviceCount(&dev_count) != hipSuccess || dev_count == 0) {
         return Status::invalid_state("no GPU available", __FILE__, __LINE__);
     }
-    const std::size_t parallel_width = config_.pipeline_parallel > 1
-        ? config_.pipeline_parallel
-        : config_.tp;
-    if (config_.devices.size() != parallel_width) {
-        return Status::invalid_argument(
-            "--device count must match --tensor-parallel or --pipeline-parallel", __FILE__, __LINE__);
-    }
     for (int device : config_.devices) {
         if (device < 0 || device >= dev_count) {
             return Status::out_of_range("device out of range", __FILE__, __LINE__);
         }
     }
+    shelf::runtime::ParallelShape topology_shape;
+    topology_shape.pp = config_.pipeline_parallel;
+    topology_shape.ep = config_.expert_parallel;
+    topology_shape.tp = config_.tp;
+    auto topology_result =
+        shelf::runtime::ParallelTopology::create(topology_shape, config_.devices);
+    if (!topology_result.ok()) {
+        return Status::invalid_argument(
+            (std::string("--device count must match pipeline_parallel * expert_parallel * "
+                         "tensor_parallel: ") + topology_result.status().message()).c_str(),
+            __FILE__, __LINE__);
+    }
+    topology_.emplace(topology_result.release());
 
     hipError_t herr = hipSetDevice(config_.devices[0]);
     if (herr != hipSuccess) {
@@ -207,13 +217,13 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
 
     const bool auto_arena = config_.arena_mode == ArenaBudgetMode::Auto;
     auto_arena_ = auto_arena;
+    std::size_t memory_capacity = config_.arena_bytes;
     if (config_.arena_mode == ArenaBudgetMode::Fixed) {
         if (config_.arena_bytes == 0u) {
             return Status::insufficient_memory(
                 "arena capacity is zero", __FILE__, __LINE__);
         }
-        startup_available_bytes_ = config_.arena_bytes;
-    } else {
+    } else if (!auto_arena) {
         std::size_t free_bytes = 0;
         std::size_t total_bytes = 0;
         herr = hipMemGetInfo(&free_bytes, &total_bytes);
@@ -221,38 +231,36 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
             return Status::hip_error("hipMemGetInfo", hipGetErrorString(herr), __FILE__,
                                      __LINE__);
         }
-        const std::size_t margin =
-            auto_arena ? kAutoArenaMarginBytes : config_.arena_bytes;
-        if (auto_arena) {
-            if (free_bytes == 0) {
-                return Status::insufficient_memory(
-                    "no VRAM available for the arena", __FILE__, __LINE__);
-            }
-            config_.arena_bytes = free_bytes > margin ? free_bytes - margin
-                                                      : free_bytes / 2u;
-            startup_available_bytes_ = free_bytes;
-            if (config_.arena_bytes == 0u) {
-                return Status::insufficient_memory(
-                    "no VRAM available for the arena", __FILE__, __LINE__);
-            }
-            fprintf(stderr, "ARENA auto: free=%s margin=%s capacity=%s\n",
-                    gpu::format_gib(free_bytes).c_str(),
-                    gpu::format_gib(margin).c_str(),
-                    gpu::format_gib(config_.arena_bytes).c_str());
-        } else {
-            if (total_bytes == 0u || margin >= total_bytes) {
-                return Status::invalid_argument(
-                    "--arena-gib margin exceeds the total VRAM", __FILE__, __LINE__);
-            }
-            config_.arena_bytes = total_bytes - margin;
-            startup_available_bytes_ = config_.arena_bytes;
-            fprintf(stderr, "ARENA total-minus: total=%s margin=%s capacity=%s\n",
-                    gpu::format_gib(total_bytes).c_str(),
-                    gpu::format_gib(margin).c_str(),
-                    gpu::format_gib(config_.arena_bytes).c_str());
+        const std::size_t margin = config_.arena_bytes;
+        if (total_bytes == 0u || margin >= total_bytes) {
+            return Status::invalid_argument(
+                "--arena-gib margin exceeds the total VRAM", __FILE__, __LINE__);
         }
-        fflush(stderr);
+        memory_capacity = total_bytes - margin;
+        fprintf(stderr, "ARENA total-minus: total=%s margin=%s capacity=%s\n",
+                gpu::format_gib(total_bytes).c_str(),
+                gpu::format_gib(margin).c_str(),
+                gpu::format_gib(memory_capacity).c_str());
     }
+
+    std::vector<int> memory_devices;
+    if (config_.pipeline_parallel > 1u || config_.expert_parallel > 1u ||
+        config_.tp > 1u) {
+        memory_devices = config_.devices;
+    } else {
+        memory_devices.push_back(config_.devices[0]);
+    }
+    auto memory_result = gpu::GpuMemoryManager::create(memory_devices, memory_capacity);
+    if (!memory_result.ok()) return memory_result.status();
+    memory_.emplace(memory_result.release());
+    for (int device : memory_devices) {
+        Status prepare_status = shelf::execution::prepare_gemm_lt(device);
+        if (!prepare_status.ok()) return prepare_status;
+    }
+    auto arena0 = memory_->arena_for(config_.devices[0]);
+    if (!arena0.ok()) return arena0.status();
+    startup_available_bytes_ = arena0.value()->capacity();
+    fflush(stderr);
 
     exec_max_tokens_ = config_.max_num_batched_tokens;
     if (exec_max_tokens_ == 0) {
@@ -270,20 +278,16 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
     if (config_.pipeline_parallel > 1) {
         return initialize_pipeline_parallel();
     }
-    if (config_.tp > 1) {
+    if (config_.tp > 1 || config_.expert_parallel > 1u) {
         return initialize_tensor_parallel();
     }
 
-    herr = hipStreamCreate(&stream_);
-    if (herr != hipSuccess) {
-        return Status::hip_error("hipStreamCreate", hipGetErrorString(herr), __FILE__, __LINE__);
-    }
-
-    auto arena_result = shelf::gpu::GpuArena::create(config_.devices[0], config_.arena_bytes);
-    if (!arena_result.ok()) {
-        return arena_result.status();
-    }
-    arena_.emplace(arena_result.release());
+    auto arena_ptr = memory_->arena_for(config_.devices[0]);
+    if (!arena_ptr.ok()) return arena_ptr.status();
+    arena_ = arena_ptr.value();
+    auto stream_ptr = memory_->stream_for(config_.devices[0]);
+    if (!stream_ptr.ok()) return stream_ptr.status();
+    stream_ = stream_ptr.value();
 
     const auto t_load_start = std::chrono::steady_clock::now();
     auto model_result = shelf::models::LoadedModel::load(
@@ -335,14 +339,16 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
         prefix_config.capture_slots = 0u;
     }
 
-    auto prefix_bytes_for = [&]() {
-        return qwen35::runtime::prefix_cache_bytes(prefix_config, gdn_layout);
-    };
+    auto prefix_bytes_for =
+        [&](const shelf::state::QsaKeyStatePoolLayout* qsa,
+            const shelf::state::PleConvStatePoolLayout* ple) {
+            return qwen35::runtime::prefix_cache_bytes(prefix_config, gdn_layout, qsa, ple);
+        };
 
     qwen35::runtime::PrefixCacheBytes prefix_bytes{};
     std::size_t prefix_capture_bytes = 0u;
     if (config_.prefix_cache) {
-        prefix_bytes = prefix_bytes_for();
+        prefix_bytes = prefix_bytes_for(nullptr, nullptr);
         prefix_capture_bytes = model_->prefix_capture_state_bytes(
             prefix_config.capture_slots, max_seq + 1u);
     }
@@ -407,16 +413,72 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
         return plan;
     };
 
+    auto create_kv_pool = [&](std::size_t pages) -> Status {
+        kv_pool_ = std::nullopt;
+        auto result = state::PagedKVPool::create(
+            *arena_, static_cast<std::uint32_t>(pages), config_.page_tokens,
+            num_attn_layers, kv_heads, head_dim, config_.kv_cache_dtype,
+            config_.octave_kv_format);
+        if (!result.ok()) return result.status();
+        kv_pool_.emplace(std::move(result.release()));
+        return Status::make_ok();
+    };
+
+    qwen35::ExecutorConfig exec_config;
+    exec_config.max_batch_rows = exec_max_tokens_;
+    exec_config.max_scheduled_requests = max_concurrent;
+    exec_config.max_scheduled_output_rows = config_.max_scheduled_output_rows;
+    exec_config.target_hidden_taps = config_.target_hidden_taps;
+    exec_config.target_hidden_tap_count = config_.target_hidden_tap_count;
+    exec_config.tp_combine_f32 = config_.tp_combine_f32;
+    exec_config.max_context_tokens = config_.max_seq_len + 1u;
+    exec_config.backend = config_.decode_backend;
+    exec_config.emit_normed_token_hidden = config_.mtp;
+    if (config_.rope_profile.has_value()) {
+        exec_config.rope_profile = *config_.rope_profile;
+    }
+
+    auto create_executor_now = [&]() -> Status {
+        auto result = model_->create_executor(
+            *slot_pool_, *gdn_pool_, *kv_pool_, *arena_, exec_config);
+        if (!result.ok()) return result.status();
+        executor_ = std::move(result.release());
+        return Status::make_ok();
+    };
+
+    Status probe_status = create_kv_pool(1u);
+    if (!probe_status.ok()) return probe_status;
+    const std::size_t executor_before = arena_->used();
+    probe_status = create_executor_now();
+    if (!probe_status.ok()) return probe_status;
+    const std::size_t executor_bytes = arena_->used() - executor_before;
+    if (executor_bytes > config_.working_set_reserve_bytes) {
+        config_.working_set_reserve_bytes = executor_bytes;
+    }
+    fprintf(stderr,
+            "MEMORY_PLAN executor footprint: %s (reserve %s)\n",
+            gpu::format_gib(executor_bytes).c_str(),
+            gpu::format_gib(config_.working_set_reserve_bytes).c_str());
+    fflush(stderr);
+
+    if (config_.prefix_cache) {
+        prefix_bytes = prefix_bytes_for(
+            executor_.qsa_state_pool != nullptr ? &executor_.qsa_state_pool->layout() : nullptr,
+            executor_.ple_conv_state_pool != nullptr
+                ? &executor_.ple_conv_state_pool->layout()
+                : nullptr);
+    }
+
     const std::size_t reserved_bytes = prefix_bytes.total() + prefix_capture_bytes +
-        config_.working_set_reserve_bytes + drafter_total_bytes;
+        drafter_total_bytes;
     const std::size_t arena_free = arena_->capacity() - arena_->used();
     if (arena_free <= reserved_bytes) {
         print_memory_plan(make_plan(kv_required_bytes, max_seq + 1u));
         return Status::insufficient_memory(
             "arena has " + gpu::format_gib(arena_free) + " free after weights but the runtime "
             "reserves " + gpu::format_gib(reserved_bytes)
-            + " for the prefix state, the working set and the drafter weights (raise "
-              "--arena-gib or lower --working-set-reserve-gib)",
+            + " for the prefix state and the drafter weights (raise "
+              "--arena-gib or lower --max-concurrent-requests)",
             __FILE__, __LINE__);
     }
     const uint32_t pages_fit =
@@ -440,50 +502,17 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
             + " needs " + std::to_string(single_request_tokens)
             + " (max supportable max_seq_len " + std::to_string(max_supportable)
             + " with --arena-gib "
-            + std::to_string(config_.arena_bytes / (1024ull * 1024ull * 1024ull))
+            + std::to_string(startup_available_bytes_ / (1024ull * 1024ull * 1024ull))
             + ")",
             __FILE__, __LINE__);
     }
     const uint32_t physical_capacity_tokens = fit_pages * config_.page_tokens;
     const uint32_t kv_pool_pages = fit_pages + 1u;
-    print_memory_plan(make_plan(
-        static_cast<std::size_t>(kv_pool_pages) * kv_page_bytes, physical_capacity_tokens));
 
-    auto kv_pool_result = state::PagedKVPool::create(
-        *arena_, kv_pool_pages, config_.page_tokens, num_attn_layers, kv_heads, head_dim,
-        config_.kv_cache_dtype, config_.octave_kv_format);
-    if (!kv_pool_result.ok()) {
-        return kv_pool_result.status();
-    }
-    kv_pool_.emplace(std::move(kv_pool_result.release()));
+    Status kv_status = create_kv_pool(kv_pool_pages);
+    if (!kv_status.ok()) return kv_status;
+    executor_.bind_kv_pool(*kv_pool_);
     const std::size_t used_after_kv = arena_->used();
-
-    qwen35::ExecutorConfig exec_config;
-    exec_config.max_batch_rows = exec_max_tokens_;
-    exec_config.max_scheduled_requests = max_concurrent;
-    exec_config.max_scheduled_output_rows = config_.max_scheduled_output_rows;
-    exec_config.target_hidden_taps = config_.target_hidden_taps;
-    exec_config.target_hidden_tap_count = config_.target_hidden_tap_count;
-    exec_config.tp_combine_f32 = config_.tp_combine_f32;
-    exec_config.max_context_tokens = config_.max_seq_len + 1u;
-    exec_config.backend = config_.decode_backend;
-    exec_config.emit_normed_token_hidden = config_.mtp;
-    if (config_.rope_profile.has_value()) {
-        exec_config.rope_profile = *config_.rope_profile;
-    }
-
-    const std::size_t executor_before = arena_->used();
-    auto exec_result = model_->create_executor(
-        *slot_pool_, *gdn_pool_, *kv_pool_, *arena_, exec_config);
-    fprintf(stderr,
-            "MEMORY_PLAN executor footprint: %s (reserve %s)\n",
-            gpu::format_gib(arena_->used() - executor_before).c_str(),
-            gpu::format_gib(config_.working_set_reserve_bytes).c_str());
-    fflush(stderr);
-    if (!exec_result.ok()) {
-        return exec_result.status();
-    }
-    executor_ = std::move(exec_result.release());
 
     qwen35::runtime::ContinuousBatcherConfig batcher_config;
     batcher_config.max_num_batched_tokens = exec_max_tokens_;
@@ -506,7 +535,16 @@ Status Qwen35ComputeRuntime::initialize(const Qwen35RuntimeConfig& config) {
         batcher_->set_prefix_cache(&prefix_cache_.value());
     }
 
-    print_host_memory({model_->host_pinned_bytes()},
+    MemoryPlan final_plan = make_plan(
+        static_cast<std::size_t>(kv_pool_pages) * kv_page_bytes, physical_capacity_tokens);
+    final_plan.measured_left = true;
+    final_plan.left_bytes = arena_->capacity() - arena_->used();
+    print_memory_plan(final_plan);
+
+    const shelf::models::HostMemoryBytes host_bytes = model_->host_memory_bytes();
+    print_host_memory({static_cast<std::size_t>(host_bytes.embedding)},
+                      static_cast<std::size_t>(host_bytes.ple_table),
+                      static_cast<std::size_t>(host_bytes.offload_experts),
                       prefix_cache_.has_value() ? prefix_cache_->reserved_bytes() : 0u);
 
     if (std::getenv("SHELF_BATCH_TRACE") != nullptr) {
@@ -597,17 +635,6 @@ void Qwen35ComputeRuntime::apply_auto_working_set_reserve() {
 Status Qwen35ComputeRuntime::initialize_pipeline_parallel() {
     const auto family = shelf::models::probe_model_dir(config_.model_dir);
     if (!family.ok()) return family.status();
-    if (family.value() == shelf::models::ModelFamily::Qwen4Exp) {
-        return Status::unsupported(
-            "Qwen4Exp is loaded by the qwen4exp load path; pipeline execution is not "
-            "wired yet",
-            __FILE__, __LINE__);
-    }
-    if (family.value() == shelf::models::ModelFamily::Qsa) {
-        return Status::unsupported(
-            "Qwen35Qsa runs single-stage; pipeline execution is not implemented",
-            __FILE__, __LINE__);
-    }
     auto config_result = qwen_hybrid::read_qwen_hybrid_config(config_.model_dir);
     if (!config_result.ok()) return config_result.status();
     const qwen_hybrid::QwenHybridConfig& text_config = config_result.value();
@@ -624,22 +651,76 @@ Status Qwen35ComputeRuntime::initialize_pipeline_parallel() {
 
     qwen35::runtime::PipelineParallelConfig pp_config;
     pp_config.model_dir = config_.model_dir;
-    pp_config.devices = config_.devices;
+    std::vector<int> stage_devices;
+    stage_devices.reserve(config_.pipeline_parallel);
+    for (uint32_t stage = 0; stage < config_.pipeline_parallel; ++stage) {
+        const uint32_t rank = topology_->rank(shelf::runtime::ParallelCoord{stage, 0u, 0u});
+        stage_devices.push_back(topology_->device(rank));
+    }
+    pp_config.devices = std::move(stage_devices);
     pp_config.stages = ranges;
     pp_config.max_batch_rows = exec_max_tokens_;
     pp_config.max_scheduled_requests = config_.max_concurrent_requests;
     pp_config.max_scheduled_output_rows = config_.max_scheduled_output_rows;
     pp_config.max_seq_len = config_.max_seq_len;
     pp_config.page_tokens = config_.page_tokens;
+    if (family.value() == shelf::models::ModelFamily::Qwen4Exp) {
+        auto q4_config = shelf::qwen4exp::read_qwen4exp_text_config(config_.model_dir);
+        if (!q4_config.ok()) return q4_config.status();
+        pp_config.pipeline_hidden_width = static_cast<uint32_t>(
+            q4_config.value().hc_count * q4_config.value().hidden_size);
+    }
     pp_config.kv_cache_dtype = config_.kv_cache_dtype;
     pp_config.octave_kv_format = config_.octave_kv_format;
-    pp_config.arena_bytes = config_.arena_bytes;
+    pp_config.memory = &*memory_;
     pp_config.working_set_reserve_bytes = config_.working_set_reserve_bytes;
     if (config_.rope_profile.has_value()) {
         pp_config.rope_profile = *config_.rope_profile;
     }
     pp_config.load_options.verify_quantized_payload_crc = config_.verify_weights;
     pp_config.build_stage_model = builder_result.value();
+
+    if (config_.tp > 1u || config_.expert_parallel > 1u) {
+        pp_config.stage_tp.resize(config_.pipeline_parallel);
+        for (std::uint32_t stage = 0; stage < config_.pipeline_parallel; ++stage) {
+            qwen35::runtime::TpCoordinatorConfig tp;
+            tp.model_dir = config_.model_dir;
+            tp.pipeline_hidden_width = pp_config.pipeline_hidden_width;
+            tp.tensor_parallel = config_.tp;
+            tp.expert_parallel = config_.expert_parallel;
+            const std::vector<std::uint32_t> stage_ranks = topology_->stage_ranks(stage);
+            tp.devices.reserve(stage_ranks.size());
+            for (std::uint32_t rank : stage_ranks) {
+                tp.devices.push_back(topology_->device(rank));
+            }
+            tp.max_batch_rows = exec_max_tokens_;
+            tp.max_scheduled_requests = config_.max_concurrent_requests;
+            tp.max_scheduled_output_rows = config_.max_scheduled_output_rows;
+            tp.max_seq_len = config_.max_seq_len;
+            tp.page_tokens = config_.page_tokens;
+            tp.kv_cache_dtype = config_.kv_cache_dtype;
+            tp.octave_kv_format = config_.octave_kv_format;
+            tp.memory = &*memory_;
+            tp.working_set_reserve_bytes = config_.working_set_reserve_bytes;
+            tp.prefix_cache = config_.prefix_cache;
+            tp.prefix_checkpoints = config_.prefix_cache_checkpoints;
+            tp.prefix_spec_ring_bytes = config_.prefix_cache_spec_ring_bytes;
+            tp.prefix_strategy = config_.prefix_cache_strategy;
+            tp.prefix_slot_count = config_.prefix_cache_slot_count;
+            tp.prefix_save_interval = config_.prefix_cache_save_interval;
+            tp.tp_combine_f32 = config_.tp_combine_f32;
+            tp.load_options.verify_quantized_payload_crc = config_.verify_weights;
+            tp.pipeline_stage.enabled = true;
+            tp.pipeline_stage.layers = ranges[stage];
+            if (const char* env = std::getenv("SHELF_KV_POOL_PAGES")) {
+                tp.kv_pool_pages = static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+            }
+            if (config_.rope_profile.has_value()) tp.rope_profile = *config_.rope_profile;
+            Status selected = shelf::models::select_tp_rank_model(tp);
+            if (!selected.ok()) return selected;
+            pp_config.stage_tp[stage] = std::move(tp);
+        }
+    }
 
     const auto t_load_start = std::chrono::steady_clock::now();
     auto coordinator_result =
@@ -651,10 +732,34 @@ Status Qwen35ComputeRuntime::initialize_pipeline_parallel() {
         std::chrono::duration<double, std::milli>(t_load_end - t_load_start).count();
 
     qwen35::runtime::PipelineStageRuntime& stage0 = pp_coordinator_->stage(0);
-    pp_model_ = std::make_unique<shelf::models::LoadedModel>(
-        stage0.model().dense_model() != nullptr
-            ? shelf::models::LoadedModel::borrow(*stage0.model().dense_model())
-            : shelf::models::LoadedModel::borrow(*stage0.model().grouped_model()));
+    const shelf::models::TpRankModel* tp_rank_model =
+        stage0.tp() != nullptr ? stage0.tp()->rank(0).rank_model() : nullptr;
+    if (tp_rank_model != nullptr) {
+        if (const auto* q4 = tp_rank_model->qwen4exp_model()) {
+            pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+                shelf::models::LoadedModel::borrow(*q4));
+        } else if (const auto* qsa = tp_rank_model->qsa_model()) {
+            pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+                shelf::models::LoadedModel::borrow(*qsa));
+        } else if (const auto* grouped = tp_rank_model->grouped_model()) {
+            pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+                shelf::models::LoadedModel::borrow(*grouped));
+        } else {
+            pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+                shelf::models::LoadedModel::borrow(*tp_rank_model->dense_model()));
+        }
+    } else if (stage0.model().qwen4exp_model() != nullptr) {
+        pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+            shelf::models::LoadedModel::borrow(*stage0.model().qwen4exp_model()));
+    } else if (stage0.model().qsa_model() != nullptr) {
+        pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+            shelf::models::LoadedModel::borrow(*stage0.model().qsa_model()));
+    } else {
+        pp_model_ = std::make_unique<shelf::models::LoadedModel>(
+            stage0.model().dense_model() != nullptr
+                ? shelf::models::LoadedModel::borrow(*stage0.model().dense_model())
+                : shelf::models::LoadedModel::borrow(*stage0.model().grouped_model()));
+    }
     fprintf(stderr,
             "MEMORY_PLAN mode=%s pipeline=%u arena=%s used=%s available=%s\n",
             auto_arena_ ? "auto" : "fixed",
@@ -668,19 +773,19 @@ Status Qwen35ComputeRuntime::initialize_pipeline_parallel() {
     std::vector<std::size_t> host_embeddings;
     host_embeddings.reserve(pp_coordinator_->stage_count());
     for (std::size_t index = 0; index < pp_coordinator_->stage_count(); ++index) {
-        host_embeddings.push_back(pp_coordinator_->stage(index).model().host_pinned_bytes());
+        host_embeddings.push_back(pp_coordinator_->stage(index).host_pinned_bytes());
     }
     char host_scope[32];
     std::snprintf(host_scope, sizeof(host_scope), " pipeline=%u",
                   static_cast<unsigned>(config_.pipeline_parallel));
-    print_host_memory(host_embeddings, 0u, host_scope, "stage");
+    print_host_memory(host_embeddings, 0u, 0u, 0u, host_scope, "stage");
 
     qwen35::runtime::ContinuousBatcherConfig batcher_config;
     batcher_config.max_num_batched_tokens = exec_max_tokens_;
     batcher_config.max_scheduled_requests = config_.max_concurrent_requests;
     batcher_config.max_seq_len = config_.max_seq_len;
     batcher_config.page_tokens = config_.page_tokens;
-    batcher_config.eos_token_ids = stage0.model().hybrid_config().stop_tokens;
+    batcher_config.eos_token_ids = stage0.hybrid_config().stop_tokens;
 
     batcher_ = std::make_unique<qwen35::runtime::ContinuousBatcher>(
         stage0.executor(), stage0.sequence_pool(), stage0.gdn_pool(), stage0.kv_pool(),
@@ -693,6 +798,8 @@ Status Qwen35ComputeRuntime::initialize_tensor_parallel() {
     qwen35::runtime::TpCoordinatorConfig tp_config;
     tp_config.model_dir = config_.model_dir;
     tp_config.devices = config_.devices;
+    tp_config.tensor_parallel = config_.tp;
+    tp_config.expert_parallel = config_.expert_parallel;
     tp_config.max_batch_rows = exec_max_tokens_;
     tp_config.max_scheduled_requests = config_.max_concurrent_requests;
     tp_config.max_scheduled_output_rows = config_.max_scheduled_output_rows;
@@ -700,7 +807,7 @@ Status Qwen35ComputeRuntime::initialize_tensor_parallel() {
     tp_config.page_tokens = config_.page_tokens;
     tp_config.kv_cache_dtype = config_.kv_cache_dtype;
     tp_config.octave_kv_format = config_.octave_kv_format;
-    tp_config.arena_bytes = config_.arena_bytes;
+    tp_config.memory = &*memory_;
     tp_config.working_set_reserve_bytes = config_.working_set_reserve_bytes;
     tp_config.prefix_cache = config_.prefix_cache;
     tp_config.prefix_checkpoints = config_.prefix_cache_checkpoints;
@@ -884,14 +991,20 @@ Status Qwen35ComputeRuntime::initialize_tensor_parallel() {
 
     std::vector<std::size_t> host_embeddings;
     host_embeddings.reserve(static_cast<std::size_t>(tp_coordinator_->tp_size()));
+    std::uint64_t host_ple = 0u;
+    std::uint64_t host_offload = 0u;
     for (int r = 0; r < tp_coordinator_->tp_size(); ++r) {
         const shelf::models::TpRankModel* rank_model =
             tp_coordinator_->rank(static_cast<std::size_t>(r)).rank_model();
         host_embeddings.push_back(rank_model != nullptr ? rank_model->host_pinned_bytes() : 0u);
+        if (rank_model == nullptr) continue;
+        host_offload += rank_model->host_offload_expert_bytes();
+        if (r == 0) host_ple = rank_model->host_ple_table_bytes();
     }
     char host_scope[32];
     std::snprintf(host_scope, sizeof(host_scope), " tp=%d", config_.tp);
-    print_host_memory(host_embeddings,
+    print_host_memory(host_embeddings, static_cast<std::size_t>(host_ple),
+                      static_cast<std::size_t>(host_offload),
                       prefix_cache_.has_value() ? prefix_cache_->reserved_bytes() : 0u,
                       host_scope);
 
@@ -936,6 +1049,27 @@ Status Qwen35ComputeRuntime::set_token_bitmask(uint64_t id, const uint32_t* mask
         return Status::invalid_state("runtime not initialized", __FILE__, __LINE__);
     }
     return batcher_->set_token_bitmask(id, mask, waiting);
+}
+
+Result<uint64_t> Qwen35ComputeRuntime::submit_structured_dflash(
+    std::vector<int32_t> input_ids, uint32_t max_new_tokens,
+    const qwen35::runtime::SamplingConfig& sampling,
+    const qwen35::runtime::ThinkingBudget& thinking) {
+    if (batcher_ == nullptr) return Status::invalid_state("runtime not initialized", __FILE__, __LINE__);
+    return batcher_->submit(std::move(input_ids), max_new_tokens, sampling, true, thinking);
+}
+
+Status Qwen35ComputeRuntime::set_structured_dflash(uint64_t id, bool delayed, int32_t close_token) {
+    return batcher_->set_structured_dflash(id, delayed, close_token);
+}
+
+Status Qwen35ComputeRuntime::activate_grammar(uint64_t id) {
+    return batcher_->activate_grammar(id);
+}
+
+Status Qwen35ComputeRuntime::set_draft_masks(uint64_t id, uint64_t round, const uint32_t* mask,
+                                             uint32_t stride, uint32_t valid_prefix) {
+    return batcher_->set_draft_masks(id, round, mask, stride, valid_prefix);
 }
 
 Status Qwen35ComputeRuntime::set_dflash2_batcher(
@@ -1039,20 +1173,6 @@ Status Qwen35ComputeRuntime::shutdown() {
         prefix_cache_.reset();
     }
 
-    if (stream_ != nullptr) {
-        hipError_t herr = hipStreamDestroy(stream_);
-        if (herr != hipSuccess && first_error.ok()) {
-            first_error = Status::hip_error(
-                "hipStreamDestroy", hipGetErrorString(herr), __FILE__, __LINE__);
-        }
-        stream_ = nullptr;
-    }
-
-    if (arena_.has_value()) {
-        auto arena_st = arena_->shutdown();
-        if (!arena_st.ok() && first_error.ok()) first_error = arena_st;
-    }
-
     batcher_.reset();
     tp_executor_ = nullptr;
     tp_slots_ = nullptr;
@@ -1064,6 +1184,12 @@ Status Qwen35ComputeRuntime::shutdown() {
     tp_group_.reset();
     pp_model_ = nullptr;
     pp_coordinator_.reset();
+
+    if (memory_.has_value()) {
+        Status st = memory_->shutdown();
+        if (!st.ok() && first_error.ok()) first_error = st;
+    }
+    arena_ = nullptr;
 
     shutdown_ = true;
     return first_error;

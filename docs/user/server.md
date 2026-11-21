@@ -75,7 +75,8 @@ Hy4-flash の server は、GPU への重み転送後に Engram 表をホスト�
 | `--port PORT` | listen port (default 8000) |
 | `--compute COMPUTE` | shelf-compute path |
 | `--max-seq-len MAX_SEQ_LEN` | max sequence length (default 32768; PLaMo 3: 2048) |
-| `--max-num-batched-tokens MAX_NUM_BATCHED_TOKENS` | token budget per scheduled step; also sets the executor row bucket (default 2048) |
+| `--max-num-batched-tokens MAX_NUM_BATCHED_TOKENS` | token budget per scheduled step; also sets the executor row bucket (default 4096) |
+| `--prefill-chunk PREFILL_CHUNK` | cap prefill tokens per step and the executor row bucket (default 4096) |
 | `--max-concurrent-requests MAX_CONCURRENT_REQUESTS` | max in-flight requests (default 4) |
 | `--inference-budget-tokens INFERENCE_BUDGET_TOKENS` | max generated tokens per request (default 32768) |
 | `--large-context-tokens LARGE_CONTEXT_TOKENS` | prompt tokens above which the larger inference budget applies (default 262144) |
@@ -83,6 +84,8 @@ Hy4-flash の server は、GPU への重み転送後に Engram 表をホスト�
 | `--arena-gib N\|auto\|-N` | GPU arena capacity in GiB; auto = free VRAM minus 0.5 GiB, -N = total VRAM minus N GiB (default auto) |
 | `--device DEVICE` | comma separated GPU devices, one per rank; count must match --tensor-parallel (default 0) |
 | `--tensor-parallel {1,2}` | tensor parallel size forwarded to compute (default 1) |
+| `--expert-parallel {1,2,4}` | expert parallel size forwarded to compute (default 1) |
+| `--pipeline-parallel {1,2,4}` | pipeline parallel size forwarded to compute (mutually exclusive with --tensor-parallel; default 1) |
 | `--kv-cache-dtype KV_CACHE_DTYPE` | KV cache dtype (default bf16) |
 | `--page-tokens PAGE_TOKENS` | paged KV page size in tokens (default 16) |
 | `--working-set-reserve-gib WORKING_SET_RESERVE_GIB` | arena headroom kept free for the working set (0 = size it from the row bucket, default 0) |
@@ -93,7 +96,7 @@ Hy4-flash の server は、GPU への重み転送後に Engram 表をホスト�
 | `--prefix-cache-save-interval PREFIX_CACHE_SAVE_INTERVAL` | periodic prefix checkpoint spacing in tokens; 0 disables periodic checkpoints (default 16384) |
 | `--dflash2-model-dir DFLASH2_MODEL_DIR` | DFlash2 draft model directory (enables speculative decoding) |
 | `--dflash2-drafts DFLASH2_DRAFTS` | speculative draft tokens per round (default 7) |
-| `--dflash2-tree-budget N\|auto` | tree verify rows: auto uses 10 for one decoding request if speculative, 8 otherwise (default auto; 0 disables) |
+| `--dflash2-tree-budget N\|auto` | tree verify rows: auto uses 10 for one decoding request if speculative, 8 otherwise (default 0; 0 disables) |
 | `--dflash2-adaptive` | batch と受理数に応じて投機を制御する |
 | `--dflash2-max-sessions DFLASH2_MAX_SESSIONS` | requests that may speculate at once; the rest decode without speculation (0 = min(--max-concurrent- requests, 8)) |
 | `--dflash2-prefill-rows DFLASH2_PREFILL_ROWS` | drafter prefill rows（default は model 側） |
@@ -101,9 +104,11 @@ Hy4-flash の server は、GPU への重み転送後に Engram 表をホスト�
 | `--mtp` | checkpoint の MTP block を drafter として使う（複数 request を同時に処理する） |
 | `--mtp-drafts MTP_DRAFTS` | MTP の draft tokens per round（default 4） |
 | `--moe-host-experts MOE_HOST_EXPERTS` | 層あたり host に退避する routed expert 数（default 0） |
+| `--lm-head-int8 {0,1}` | lm head を load 時に INT8 W32 へ量子化する（default 1） |
 | `--pcie-frac PCIE_FRAC` | runtime が使ってよい PCIe の割合（default 0.25） |
 | `--pcie-gbps PCIE_GBPS` | 想定する PCIe 帯域 GB/s（default 25） |
 | `--ple-prefetch {0,1}` | prefill 中に次の PLE 行を先読みする（default 1） |
+| `--ple-hot-cache-gib PLE_HOT_CACHE_GIB` | PLE の pinned host ブロックキャッシュ容量 GiB（default 0 = 全量常駐） |
 | `--tp-transport TP_TRANSPORT` | tensor parallel transport の選択 |
 | `--verify-weights` | verify quantized payload CRC32 on load |
 <!-- /cli:server -->
@@ -167,15 +172,13 @@ request 1 個あたりの生成予算（推論予算）は `--inference-budget-t
   Queued になり、Active の完了後に admission される。
 - tool calling / sampling / cancel は DFlash2 経路でも利用できる。
 - verify は単一 request を含め既定で lossy chunk を使うため、非投機 greedy と
-  生成列が一致しない場合がある。`SHELF_GDN_VERIFY_CHUNKED=0` で serial に戻せる。
-  `SHELF_GDN_VERIFY_CHUNKED_EXACT=1` は exact chunk を選ぶが、bit 一致は保証しない。
-- `--dflash2-adaptive` は投機を自動で停止・再試行する実験的な方式で、投機を停止する batch 負荷の
-  上限は `SHELF_DFLASH2_POLICY_MAX_SESSIONS` で上書きできる（既定 12）。
+  生成列が一致しない場合がある。verify 経路切替・`--dflash2-adaptive` の上限上書き・
+  `SHELF_DFLASH2_PREFILL_ROWS` などの環境変数は [env_vars.md](env_vars.md#5-dflash2-投機デコード) を参照。
 
 TP=1 で drafter の block size が 8、sliding window が 256 以上の場合、prefill の
-context 構築は既定で最大 256 行ずつ処理する。`SHELF_DFLASH2_PREFILL_ROWS=8` で
-従来の処理に戻せる。`256` は明示的に既定を選択し、それ以外の値は起動エラーになる。
-TP>1 または上記の drafter 条件を満たさない場合は従来の処理に戻る。
+context 構築は既定で最大 256 行ずつ処理する（`--dflash2-prefill-rows 8` または
+`SHELF_DFLASH2_PREFILL_ROWS=8` で従来の処理に戻せる）。TP>1 または上記の drafter 条件を
+満たさない場合は従来の処理に戻る。
 
 Qwen3.8-27B-DFlash2、同時 request 1 件では追加 scratch は 16.953 MiB。KV の自動予算は
 その分減るため、収容できる context の上限も下がる。実際の容量は起動 log の
@@ -331,7 +334,7 @@ curl http://127.0.0.1:8000/v1/meta
 | `max_concurrent_requests` | `--max-concurrent-requests`。最大 in-flight 数 |
 | `inference_budget` | 推論予算。`tokens`（`--inference-budget-tokens`）、`large_context_tokens`、`large_context_inference_budget_tokens`、既定予算での `answer_reserve_tokens` / `thinking_budget_tokens` |
 | `arena_gib` | `--arena-gib`（`"auto"` または数値 GiB） |
-| `device` / `tensor_parallel` | `--device` / `--tensor-parallel` |
+| `device` / `tensor_parallel` / `expert_parallel` / `pipeline_parallel` | `--device` / `--tensor-parallel` / `--expert-parallel` / `--pipeline-parallel` |
 | `kv_cache_dtype` | KV cache の dtype |
 | `working_set_reserve_gib` | `--working-set-reserve-gib` |
 | `speculative` | 有効時の drafter（`{"method": "dflash2", "drafts": 7}` 等）。無効時は `null` |
@@ -546,10 +549,15 @@ KV Banker が Active 完了後に admission する。`max_seq_len + 1` すら入
 **起動時に拒否**する（`--working-set-reserve-gib` が起動後に必要な余白、
 DFlash2 有効時は drafter の weight と session pool 領域も確保計算に入る）。
 
-`--max-num-batched-tokens N`（既定 2048）は 1 executor step の token 予算で、
+`--max-num-batched-tokens N`（既定 4096）は 1 executor step の token 予算で、
 executor の row bucket も決める。prompt が N を超えても prefill は chunk 分割で進む。
 N を下げると program workspace が減り、その分だけ KV capacity が増える
 （context を大きく取る構成では N が実質的な容量ダイヤルになる）。
+
+`--prefill-chunk N`（既定 4096）を指定すると、`--max-num-batched-tokens` との
+小さい方を 1 step の予算と row bucket に使う。N は 16〜8192 である。
+既定の 4096 は multi-chunk prefill の GDN state を f32 で保持する前提で、
+chunk 2048 と品質が一致する（`docs/research/20261119/prefill_chunk_quality.md`）。
 
 client が connection を切断すると、stream / 非 stream のどちらでも in-flight generation は
 cancel される（`finish_reason="cancelled"`）。MTP の prefill は次の chunk 境界（`--max-num-batched-tokens`）、
@@ -772,7 +780,8 @@ suite の詳細は [../developer/testing.md](../developer/testing.md) を参照�
 ## 構造化出力
 
 Chat Completions は `response_format` の `json_object` と `json_schema` を受理する。
-Responses は `text.format` の `json_schema` を同じ制約経路で受理する。
+Responses は `text.format` の `text`、`json_object`、`json_schema` を受理し、
+`json_object` と `json_schema` を同じ制約経路で処理する。
 thinking 有効時は `</think>` まで自由に生成し、その後の回答に制約を適用する。
 単一 token の close tag を持たないモデルでの thinking 併用、tools、stop との
 併用は HTTP 400 で拒否する。stream と非 stream、temperature > 0 に対応する。
@@ -792,7 +801,10 @@ string 内の tool markup による区切り衝突を避けるため、生成さ
 strict tools の stream は完成した tool call をまとめて送る。生成上限に達した未完成の call は
 返さない。strict tools と stop の併用、および response_format と tools の併用は 400 とする。
 
-制約付き request は DFlash2 / MTP が有効でも通常 decode を使用し、投機との併用は未対応である。
+制約付き request は DFlash2 が有効な場合、DFlash2 投機 decode と併用して動作する
+（thinking 有効時は `</think>` まで通常どおり DFlash2 で生成し、検出位置で状態を整えて
+次のラウンドから制約付き DFlash2 へ切り替える）。MTP が有効な場合は引き続き通常 decode へ
+フォールバックする。
 
 ## PLaMo 3 Translate
 

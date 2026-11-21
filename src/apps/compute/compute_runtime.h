@@ -14,7 +14,9 @@
 #include <shelf/runtime/scheduling_types.h>
 #include <shelf/models/qwen35/runtime/tensor_parallel.h>
 #include <shelf/runtime/state_types.h>
+#include <shelf/runtime/parallel/parallel_topology.h>
 #include <shelf/core/memory/arena.h>
+#include <shelf/core/memory/gpu_memory_manager.h>
 #include <shelf/core/status.h>
 #include <hip/hip_runtime.h>
 
@@ -56,6 +58,7 @@ struct Qwen35RuntimeConfig {
         return want < cap ? want : cap;
     }
     uint32_t dflash2_prefill_rows = 0;
+    bool dflash2_host_token_ids = false;
     bool mtp = false;
     bool mtp_serve = false;
     uint32_t mtp_drafts = 7;
@@ -70,6 +73,7 @@ struct Qwen35RuntimeConfig {
     uint32_t page_tokens = 16;
     std::vector<int> devices = {0};
     uint32_t tp = 1;
+    uint32_t expert_parallel = 1;
     uint32_t pipeline_parallel = 1;
     kernel::KVCacheDType kv_cache_dtype = kernel::KVCacheDType::BF16;
     kernel::OctaveKVCacheFormat octave_kv_format{};
@@ -117,6 +121,14 @@ class Qwen35ComputeRuntime {
         const qwen35::runtime::ThinkingBudget& thinking);
 
     Status set_token_bitmask(uint64_t id, const uint32_t* mask, bool waiting);
+    Status set_structured_dflash(uint64_t id, bool delayed, int32_t close_token);
+    Status activate_grammar(uint64_t id);
+    Status set_draft_masks(uint64_t id, uint64_t round, const uint32_t* mask,
+                           uint32_t stride, uint32_t valid_prefix);
+    Result<uint64_t> submit_structured_dflash(
+        std::vector<int32_t> input_ids, uint32_t max_new_tokens,
+        const qwen35::runtime::SamplingConfig& sampling,
+        const qwen35::runtime::ThinkingBudget& thinking);
 
     Result<qwen35::runtime::StepResult> step();
 
@@ -137,6 +149,7 @@ class Qwen35ComputeRuntime {
     bool is_shutdown() const noexcept { return shutdown_; }
 
     const Qwen35RuntimeConfig& config() const noexcept { return config_; }
+    bool dflash2_host_token_ids() const noexcept { return config_.dflash2_host_token_ids; }
 
     const shelf::models::LoadedModel& model() const
     {
@@ -229,6 +242,13 @@ class Qwen35ComputeRuntime {
     bool auto_arena_ = false;
     std::size_t startup_available_bytes_ = 0;
 
+    // The PP / EP / TP coordinates and device assignment. Every coordinator derives its
+    // rank groups from this one statement.
+    std::optional<::shelf::runtime::ParallelTopology> topology_;
+
+    // Outlives every runtime below: they borrow these arenas.
+    std::optional<gpu::GpuMemoryManager> memory_;
+
     // The tensor parallel group owns the ranks, their weights and the loaded-model handle.
     // tp_coordinator_ is a handle into it, so it is cleared before the group is.
     std::unique_ptr<shelf::models::TpGroup> tp_group_;
@@ -243,7 +263,7 @@ class Qwen35ComputeRuntime {
     hipStream_t tp_stream_ = nullptr;
 
     hipStream_t stream_ = nullptr;
-    std::optional<gpu::GpuArena> arena_;
+    gpu::GpuArena* arena_ = nullptr;
     std::unique_ptr<shelf::models::LoadedModel> model_;
     std::optional<state::SequenceSlotPool> slot_pool_;
     std::optional<state::GdnStatePool> gdn_pool_;

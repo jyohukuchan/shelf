@@ -17,6 +17,7 @@ add_library(shelf_gpu STATIC
     src/shelf/core/memory/tensor.cpp
     src/shelf/core/gpu/scoped_device.cpp
     src/shelf/core/memory/arena.hip
+    src/shelf/core/memory/gpu_memory_manager.hip
 )
 target_compile_features(shelf_gpu PRIVATE cxx_std_20)
 target_include_directories(shelf_gpu PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -146,15 +147,12 @@ set(SHELF_OPTIMIZED_KERNEL_SOURCES
     src/shelf/kernels/optimized/linear/fp8_ptpc.hip
     src/shelf/kernels/optimized/linear/lm_head_int8.hip
     src/shelf/kernels/optimized/linear/mxfp4.hip
-    src/shelf/kernels/optimized/linear/exl3_family/mul1/prefill.hip
     src/shelf/kernels/optimized/linear/exl3_family/mul24/decode.hip
     src/shelf/kernels/optimized/linear/exl3_family/mul24/projection.hip
     src/shelf/kernels/optimized/linear/exl3_family/mul24/projection_prefill.hip
     src/shelf/kernels/optimized/linear/exl3_family/mul24/prefill.hip
     src/shelf/kernels/optimized/linear/exl3_family/mul24/prefill_wmma.hip
-    src/shelf/kernels/optimized/linear/exl3_family/mul1/verify.hip
     src/shelf/kernels/optimized/linear/exl3_family/mul24/workspace.cpp
-    src/shelf/kernels/optimized/linear/exl3_family/mul1/launch_plan.cpp
     src/shelf/kernels/optimized/linear/exl3_family/mul24/split_plan.cpp
     src/shelf/kernels/optimized/linear/exl3_family/variant.cpp
     src/shelf/kernels/optimized/attention/paged_decode.hip
@@ -185,13 +183,13 @@ set(SHELF_OPTIMIZED_KERNEL_SOURCES
 set(SHELF_FUSED_KERNEL_SOURCES
     src/shelf/kernels/fused/attention/octave.hip
     src/shelf/kernels/fused/exl3/decode.hip
-    src/shelf/kernels/fused/exl3/epilogue.hip
     src/shelf/kernels/fused/exl3/group_gemm.hip
     src/shelf/kernels/fused/exl3/grouped.hip
     src/shelf/kernels/fused/exl3/producer_rotate.hip
     src/shelf/kernels/fused/exl3/producer_rotate_rows.hip
     src/shelf/kernels/fused/exl3/rotate_out.hip
     src/shelf/kernels/fused/fp8_activation_producer.hip
+    src/shelf/kernels/fused/mxfp4_activation_producer.hip
     src/shelf/kernels/fused/exl3/rotate_quantize.hip
     src/shelf/kernels/fused/hyper_connection.hip
     src/shelf/kernels/fused/kv_append_octave.hip
@@ -233,6 +231,7 @@ add_library(shelf_runtime STATIC
     src/shelf/runtime/graph/primitive_graph.cpp
     src/shelf/runtime/stream_bridge.cpp
     src/shelf/runtime/program/program.cpp
+    src/shelf/runtime/parallel/parallel_topology.cpp
     src/shelf/runtime/tp/tensor_parallel.cpp
     src/shelf/runtime/tp/pipeline_parallel.cpp
     src/shelf/runtime/tp/tp_execution.cpp
@@ -492,7 +491,7 @@ target_compile_features(shelf_qwen4exp PRIVATE cxx_std_20)
 target_include_directories(shelf_qwen4exp PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_include_directories(shelf_qwen4exp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_include_directories(shelf_qwen4exp SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/vendor")
-target_link_libraries(shelf_qwen4exp PUBLIC shelf_qwen_hybrid shelf_weights shelf_io shelf_quant_bundle shelf_gpu)
+target_link_libraries(shelf_qwen4exp PUBLIC shelf_qwen_hybrid shelf_weights shelf_io shelf_quant_bundle shelf_gpu shelf_quant_ngram)
 target_compile_options(shelf_qwen4exp PRIVATE -Wall -Wextra -Wpedantic -Werror=return-type)
 
 # Model weight loading entry for the qwen35 family: the one place that links both the

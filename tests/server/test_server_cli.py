@@ -46,6 +46,16 @@ def main() -> int:
                   value_of(argv, "--prefix-cache-strategy") == "slot",
                   repr(value_of(argv, "--prefix-cache-strategy")))
 
+    chunk = shelf_server.parse_args([
+        "--model-dir", "models/unused",
+        "--device", "0",
+        "--prefill-chunk", "1024",
+    ])
+    chunk_argv = shelf_server.build_compute_argv(chunk)
+    checker.check("prefill-chunk-forwarded",
+                  value_of(chunk_argv, "--prefill-chunk") == "1024",
+                  repr(value_of(chunk_argv, "--prefill-chunk")))
+
     defaults = shelf_server.parse_args([
         "--model-dir", "models/unused",
         "--device", "0",
@@ -72,6 +82,9 @@ def main() -> int:
         "--placement", "owners.json", "--max-seq-len", "2304", "--chunk", "1024",
         "--dfly-dir", "draft",
     ])
+    checker.check("default-prefill-chunk-absent",
+                  "--prefill-chunk" not in default_argv,
+                  repr(value_of(default_argv, "--prefill-chunk")))
     return checker.done()
 
 

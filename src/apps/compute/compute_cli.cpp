@@ -35,6 +35,10 @@ void apply_env_double(const char* name, double value) {
     setenv(name, buffer, 1);
 }
 
+void apply_env_string(const char* name, const char* value) {
+    setenv(name, value, 1);
+}
+
 bool parse_float(const char* s, float& out) {
     if (s == nullptr || *s == '\0') return false;
     char* end = nullptr;
@@ -85,10 +89,15 @@ void compute_usage(const char* prog) {
     printf("  --max-concurrent-requests N  max in-flight requests (default 4)\n");
     printf("  --max-num-batched-tokens N   token budget per scheduled step; also sets\n");
     printf("                         the executor row bucket (default 2048)\n");
+    printf("  --prefill-chunk N      prompt tokens per prefill step; also caps the row\n"
+           "                         bucket (default 512; serve caps max-num-batched-tokens\n"
+           "                         when given)\n");
     printf("  --ple-prefetch 0|1      prefetch the next PLE rows during prefill (default 1)\n");
-    printf("  --device N|N,M         GPU device(s); count must match --tensor-parallel or --pipeline-parallel (default 0)\n");
+    printf("  --device N|N,M         GPU device(s); count must match pipeline_parallel *\n"
+           "                         expert_parallel * tensor_parallel (default 0)\n");
     printf("  --tensor-parallel N    tensor parallel degree 1 | 2 | 4 (default 1)\n");
-    printf("  --pipeline-parallel N  pipeline-parallel stage count (default 1; requires --tensor-parallel 1)\n");
+    printf("  --expert-parallel N    expert parallel degree 1 | 2 | 4 (default 1)\n");
+    printf("  --pipeline-parallel N  pipeline-parallel stage count (default 1)\n");
     printf("  --kv-cache-dtype TYPE  bf16 | fp8 | octave:cKvV | octave:bRnNvV (default bf16)\n");
     printf("  --rope-factor MODE     auto | 1 | 2 | 4; static YaRN rope factor\n");
     printf("                         (default auto = model config: native unless the\n");
@@ -108,6 +117,17 @@ void compute_usage(const char* prog) {
     printf("  --top-k N              keep the N highest logits (default 0 = disabled)\n");
     printf("  --seed N               sampling seed (default 0)\n");
     printf("  --moe-host-experts N    routed experts per layer kept in host memory (default 0)\n");
+    printf("  --moe-cache-swap-budget N   expert cache swap budget (default 96)\n");
+    printf("  --moe-cache-min-gain N  minimum frequency gain to swap (default 150)\n");
+    printf("  --moe-cache-rebalance-steps N  rebalance interval in steps (default 4)\n");
+    printf("  --moe-cache-rebalance-routes N  rebalance interval in routes (0 = auto)\n");
+    printf("  --moe-cache-decay N     halve expert frequency at this count (default 4096)\n");
+    printf("  --moe-cache-log-interval N  expert cache hit-rate log interval (default 64)\n");
+    printf("  --moe-cache-oracle 0|1  log cache oracle decisions (default 0)\n");
+    printf("  --ple-artifact 0|1      write/read <model_dir>/quanted_ple.bin (default 1)\n");
+    printf("  --ple-stream-io MODE    pread | mmap | direct (default mmap)\n");
+    printf("  --ple-hot-cache-gib N   pinned host block cache for PLE; 0 = full resident (default 0)\n");
+    printf("  --lm-head-int8 0|1      quantize the BF16 lm head to INT8 W32 on load (default 1)\n");
     printf("  --pcie-frac F           share of PCIe the runtime may use (default 0.25)\n");
     printf("  --pcie-gbps F           assumed PCIe bandwidth in GB/s (default 25)\n");
     printf("  --dflash2-model-dir PATH  DFlash2 draft model directory; enables\n");
@@ -171,9 +191,12 @@ int parse_compute_options(int argc, char** argv, ComputeOptions& opt) {
     auto& arena_gib_auto = opt.arena_gib_auto;
     auto& page_tokens = opt.page_tokens;
         auto& max_num_batched_tokens = opt.max_num_batched_tokens;
+        auto& prefill_chunk = opt.prefill_chunk;
+        auto& prefill_chunk_set = opt.prefill_chunk_set;
 auto& max_concurrent_requests = opt.max_concurrent_requests;
     auto& devices = opt.devices;
     auto& tp = opt.tp;
+    auto& expert_parallel = opt.expert_parallel;
     auto& pipeline_parallel = opt.pipeline_parallel;
     auto& kv_cache_dtype = opt.kv_cache_dtype;
     shelf::runtime::DecodeBackend& decode_backend = opt.decode_backend;
@@ -239,11 +262,24 @@ auto& max_concurrent_requests = opt.max_concurrent_requests;
                 fprintf(stderr, "bad --max-num-batched-tokens (16..8192)\n");
                 return kComputeParseError;
             }
+        } else if (std::strcmp(argv[i], "--prefill-chunk") == 0 && i + 1 < argc) {
+            if (!parse_uint(argv[++i], prefill_chunk) || prefill_chunk < 16u ||
+                prefill_chunk > 8192u) {
+                fprintf(stderr, "bad --prefill-chunk (16..8192)\n");
+                return kComputeParseError;
+            }
+            prefill_chunk_set = true;
         } else if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
             if (!parse_devices(argv[++i], devices)) { fprintf(stderr, "bad --device\n"); return kComputeParseError; }
         } else if (std::strcmp(argv[i], "--tensor-parallel") == 0 && i + 1 < argc) {
             if (!parse_uint(argv[++i], tp) || (tp != 1 && tp != 2 && tp != 4)) {
                 fprintf(stderr, "bad --tensor-parallel (expected 1, 2 or 4)\n");
+                return kComputeParseError;
+            }
+        } else if (std::strcmp(argv[i], "--expert-parallel") == 0 && i + 1 < argc) {
+            if (!parse_uint(argv[++i], expert_parallel) ||
+                (expert_parallel != 1 && expert_parallel != 2 && expert_parallel != 4)) {
+                fprintf(stderr, "bad --expert-parallel (expected 1, 2 or 4)\n");
                 return kComputeParseError;
             }
         } else if (std::strcmp(argv[i], "--pipeline-parallel") == 0 && i + 1 < argc) {
@@ -403,6 +439,84 @@ auto& max_concurrent_requests = opt.max_concurrent_requests;
                 return kComputeParseError;
             }
             apply_env_u32("SHELF_MOE_HOST_EXPERTS", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-swap-budget") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value)) {
+                fprintf(stderr, "bad --moe-cache-swap-budget\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_SWAP_BUDGET", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-min-gain") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value)) {
+                fprintf(stderr, "bad --moe-cache-min-gain\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_MIN_GAIN", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-rebalance-steps") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value)) {
+                fprintf(stderr, "bad --moe-cache-rebalance-steps\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_REBALANCE_STEPS", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-rebalance-routes") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value)) {
+                fprintf(stderr, "bad --moe-cache-rebalance-routes\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_REBALANCE_ROUTES", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-oracle") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value) || value > 1u) {
+                fprintf(stderr, "bad --moe-cache-oracle (expected 0 or 1)\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_ORACLE", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-decay") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value) || value == 0u) {
+                fprintf(stderr, "bad --moe-cache-decay\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_DECAY", value);
+        } else if (std::strcmp(argv[i], "--moe-cache-log-interval") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value) || value == 0u) {
+                fprintf(stderr, "bad --moe-cache-log-interval\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_MOE_CACHE_LOG_INTERVAL", value);
+        } else if (std::strcmp(argv[i], "--ple-artifact") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value) || value > 1u) {
+                fprintf(stderr, "bad --ple-artifact (expected 0 or 1)\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_PLE_ARTIFACT", value);
+        } else if (std::strcmp(argv[i], "--ple-stream-io") == 0 && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (std::strcmp(value, "pread") != 0 && std::strcmp(value, "mmap") != 0 &&
+                std::strcmp(value, "direct") != 0) {
+                fprintf(stderr, "bad --ple-stream-io (expected pread, mmap or direct)\n");
+                return kComputeParseError;
+            }
+            apply_env_string("SHELF_PLE_STREAM_IO", value);
+        } else if (std::strcmp(argv[i], "--ple-hot-cache-gib") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value)) {
+                fprintf(stderr, "bad --ple-hot-cache-gib (expected a non-negative integer)\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_PLE_HOT_CACHE_GIB", value);
+        } else if (std::strcmp(argv[i], "--lm-head-int8") == 0 && i + 1 < argc) {
+            unsigned long value = 0;
+            if (!parse_uint(argv[++i], value) || value > 1u) {
+                fprintf(stderr, "bad --lm-head-int8 (expected 0 or 1)\n");
+                return kComputeParseError;
+            }
+            apply_env_u32("SHELF_LM_HEAD_INT8", value);
         } else if (std::strcmp(argv[i], "--pcie-frac") == 0 && i + 1 < argc) {
             float value = 0.0f;
             if (!parse_float(argv[++i], value) || value <= 0.0f || value > 1.0f) {
@@ -447,13 +561,6 @@ auto& max_concurrent_requests = opt.max_concurrent_requests;
         }
     }
 
-    if (!dflash2_model_dir.empty() && !opt.dflash2_tree && opt.dflash2_tree_budget == 0 &&
-        !opt.dflash2_tree_budget_explicit && dflash2_drafts == 7 && tp == 1 &&
-        (serve_stdio || sampling.temperature == 0.0f)) {
-        opt.dflash2_tree_budget_auto = true;
-        opt.dflash2_tree_budget = 10;
-        opt.dflash2_tree = true;
-    }
     return kComputeParseOk;
 }
 
@@ -467,6 +574,7 @@ int validate_compute_options(const ComputeOptions& opt) {
     const auto& max_concurrent_requests = opt.max_concurrent_requests;
     const auto& devices = opt.devices;
     const auto& tp = opt.tp;
+    const auto& expert_parallel = opt.expert_parallel;
     const auto& pipeline_parallel = opt.pipeline_parallel;
     const auto& kv_cache_dtype = opt.kv_cache_dtype;
     const shelf::runtime::DecodeBackend& decode_backend = opt.decode_backend;
@@ -495,17 +603,18 @@ int validate_compute_options(const ComputeOptions& opt) {
         fprintf(stderr, "--tensor-parallel must be 1, 2 or 4\n");
         return kComputeParseError;
     }
+    const std::size_t parallel_width =
+        static_cast<std::size_t>(pipeline_parallel) *
+        static_cast<std::size_t>(expert_parallel) *
+        static_cast<std::size_t>(tp);
+    if (devices.size() != parallel_width) {
+        fprintf(stderr,
+                "--device expects %zu entries for pipeline_parallel %lu * expert_parallel %lu "
+                "* tensor_parallel %lu, got %zu\n",
+                parallel_width, pipeline_parallel, expert_parallel, tp, devices.size());
+        return kComputeParseError;
+    }
     if (pipeline_parallel > 1) {
-        if (tp != 1) {
-            fprintf(stderr, "--pipeline-parallel > 1 requires --tensor-parallel 1\n");
-            return kComputeParseError;
-        }
-        if (devices.size() != pipeline_parallel) {
-            fprintf(stderr,
-                    "--device expects %lu entries for --pipeline-parallel %lu, got %zu\n",
-                    pipeline_parallel, pipeline_parallel, devices.size());
-            return kComputeParseError;
-        }
         if (!dflash2_model_dir.empty()) {
             fprintf(stderr, "--pipeline-parallel does not support DFlash2 speculative decoding\n");
             return kComputeParseError;
@@ -518,10 +627,6 @@ int validate_compute_options(const ComputeOptions& opt) {
             fprintf(stderr, "--pipeline-parallel does not support --hidden-taps\n");
             return kComputeParseError;
         }
-    } else if (devices.size() != tp) {
-        fprintf(stderr, "--device expects %lu entries for --tensor-parallel %lu, got %zu\n",
-                tp, tp, devices.size());
-        return kComputeParseError;
     }
     {
         std::vector<int> unique_devices = devices;
@@ -541,10 +646,6 @@ int validate_compute_options(const ComputeOptions& opt) {
     shelf::kernel::OctaveKVCacheFormat octave_format{};
     const bool octave = shelf::kernel::parse_octave_kv_cache_format(
         kv_cache_dtype, octave_format);
-    if (octave && pipeline_parallel != 1) {
-        fprintf(stderr, "Octave KV cache currently requires PP=1\n");
-        return kComputeParseError;
-    }
     if (opt.dflash2_tree_budget != 0 && opt.dflash2_tree_budget < dflash2_drafts + 1) {
         fprintf(stderr, "tree budget must include anchor and all draft positions\n");
         return kComputeParseError;

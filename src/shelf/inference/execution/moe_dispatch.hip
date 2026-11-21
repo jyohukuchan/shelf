@@ -3,7 +3,6 @@
 #include <shelf/inference/execution/decode_perf_stats.h>
 #include <shelf/inference/execution/program_executor.h>
 #include <shelf/kernels/optimized/linear/mxfp4.h>
-#include <shelf/kernels/optimized/linear/exl3_mul1.h>
 #include <shelf/kernels/optimized/linear/exl3_mul24.h>
 #include <shelf/kernels/fused/moe/combine.h>
 #include <shelf/kernels/fused/moe/router.h>
@@ -92,6 +91,8 @@ Result<MoePlanView> resolve_moe_plan(const Program& program, const DispatchBindi
     view.arrays.miss_rows = base + capacity.miss_rows_offset;
     view.arrays.miss_base = base + capacity.miss_base_offset;
     view.arrays.miss_count = base + capacity.miss_count_offset;
+    view.arrays.hit_expert_group_begin = base + capacity.hit_expert_group_begin_offset;
+    view.arrays.miss_expert_group_begin = base + capacity.miss_expert_group_begin_offset;
     return view;
 }
 
@@ -157,6 +158,7 @@ Result<OptimizedLaunchResult> try_launch_moe_plan_scan(const Program& program,
         a.tile_counts, a.expert_row_begin, a.tile_base, a.expert_group_begin, a.group_expert,
         a.group_rows, a.group_count, a.row_token, expert_slot, a.hit_slot, a.hit_rows,
         a.hit_base, a.hit_count, a.miss_slot, a.miss_rows, a.miss_base, a.miss_count,
+        a.hit_expert_group_begin, a.miss_expert_group_begin,
         plan.value().tokens, plan.value().experts, plan.value().top_k, stream);
     if (herr != hipSuccess)
         return Status::hip_error("moe plan scan launch", hipGetErrorString(herr), __FILE__,
@@ -301,9 +303,6 @@ Result<OptimizedLaunchResult> try_launch_moe_grouped_linear(const Program& progr
     return OptimizedLaunchResult{OptimizedLaunchKind::Launched};
 }
 
-// Default for mul24 expert activations; SHELF_EXL3_INT8_MOE overrides it.
-constexpr bool kExl3Int8MoeDefault = false;
-
 Result<OptimizedLaunchResult> try_launch_moe_grouped_exl3(const Program& program,
                                                           const DispatchBinding& b,
                                                           HostExecutionContext& ctx,
@@ -317,6 +316,9 @@ Result<OptimizedLaunchResult> try_launch_moe_grouped_exl3(const Program& program
 
     const WeightSlot e = ctx.weights[b.weight_index];
     if (e.encoding != 4u) return bad("moe grouped exl3: encoding != Exl3");
+    if (e.compute_spec != static_cast<uint8_t>(
+            ::shelf::quantization::ComputeSpecId::EXL3_MUL24_INT8_W8A8_F32_BF16))
+        return Status::unsupported("moe grouped exl3 requires mul24 INT8", __FILE__, __LINE__);
     if (e.codes == nullptr || e.exl3_suh == nullptr || e.exl3_svh == nullptr)
         return bad("moe grouped exl3: weight planes missing");
     if (e.experts < 2u) return bad("moe grouped exl3: weight is not an expert plane");
@@ -360,17 +362,6 @@ Result<OptimizedLaunchResult> try_launch_moe_grouped_exl3(const Program& program
     args.output_dtype = out.dtype == ValueDType::BF16 ? 0u : 1u;
     args.ka = e.exl3_ka;
     args.half = e.exl3_half;
-    args.mul24 = e.compute_spec == static_cast<uint8_t>(
-                                       ::shelf::quantization::ComputeSpecId::
-                                           EXL3_MUL24_INT8_W8A8_F32_BF16)
-                     ? 1u
-                     : 0u;
-    // SHELF_EXL3_INT8_MOE=1 runs mul24 experts with INT8 activations (iu8 WMMA); 0 keeps the FP16 GEMM.
-    static const bool int8_act = [] {
-        const char* v = std::getenv("SHELF_EXL3_INT8_MOE");
-        return v != nullptr ? std::atoi(v) != 0 : kExl3Int8MoeDefault;
-    }();
-    args.int8_act = args.mul24 != 0u && int8_act ? 1u : 0u;
     args.trellis_batch_stride = e.codes_batch_stride_bytes;
     args.suh_batch_stride = e.exl3_suh_batch_stride_bytes;
     args.svh_batch_stride = e.exl3_svh_batch_stride_bytes;
@@ -381,11 +372,57 @@ Result<OptimizedLaunchResult> try_launch_moe_grouped_exl3(const Program& program
     args.row_token = token_rows ? plan.value().arrays.row_token : nullptr;
     args.group_capacity = plan.value().group_capacity;
 
-    const hipError_t herr =
-        ::shelf::kernel::launch_gemm_exl3_w16a16_grouped(args, stream);
+    auto launch_plane = [&](const WeightSlot& plane, const uint32_t* group_expert,
+                            const uint32_t* group_rows, const uint32_t* group_count,
+                            const uint32_t* group_row_base,
+                            const uint32_t* expert_group_begin) -> hipError_t {
+        ::shelf::kernel::Exl3GroupedArgs a = args;
+        a.trellis = plane.codes;
+        a.suh = plane.exl3_suh;
+        a.svh = plane.exl3_svh;
+        a.group_expert = group_expert;
+        a.group_rows = group_rows;
+        a.group_count = group_count;
+        a.group_row_base = group_row_base;
+        a.expert_group_begin = expert_group_begin;
+        return ::shelf::kernel::launch_gemm_exl3_int8_grouped(a, stream);
+    };
+
+    const uint32_t* hit_expert_group_begin =
+        b.host_weight_index == ::shelf::runtime::kNoWeight
+            ? plan.value().arrays.expert_group_begin
+            : plan.value().arrays.hit_expert_group_begin;
+    hipError_t herr = launch_plane(e, plan.value().arrays.hit_slot,
+                                   plan.value().arrays.hit_rows,
+                                   plan.value().arrays.hit_count,
+                                   plan.value().arrays.hit_base,
+                                   hit_expert_group_begin);
     if (herr != hipSuccess)
         return Status::hip_error("moe grouped exl3 launch", hipGetErrorString(herr),
                                  __FILE__, __LINE__);
+
+    if (b.host_weight_index != ::shelf::runtime::kNoWeight) {
+        if (b.host_weight_index >= ctx.weight_count)
+            return bad("moe grouped exl3: host weight_index invalid");
+        const WeightSlot host = ctx.weights[b.host_weight_index];
+        if (host.encoding != 4u || host.codes == nullptr || host.exl3_suh == nullptr ||
+            host.exl3_svh == nullptr || host.experts < 2u || host.rows != e.rows ||
+            host.k_padded != e.k_padded || host.exl3_ka != e.exl3_ka ||
+            host.exl3_half != e.exl3_half || host.compute_spec != e.compute_spec ||
+            host.codes_row_stride_bytes != e.codes_row_stride_bytes ||
+            host.codes_batch_stride_bytes != e.codes_batch_stride_bytes ||
+            host.exl3_suh_batch_stride_bytes != e.exl3_suh_batch_stride_bytes ||
+            host.exl3_svh_batch_stride_bytes != e.exl3_svh_batch_stride_bytes)
+            return bad("moe grouped exl3: host expert plane mismatch");
+        herr = launch_plane(host, plan.value().arrays.miss_slot,
+                            plan.value().arrays.miss_rows,
+                            plan.value().arrays.miss_count,
+                            plan.value().arrays.miss_base,
+                            plan.value().arrays.miss_expert_group_begin);
+        if (herr != hipSuccess)
+            return Status::hip_error("moe grouped exl3 host launch", hipGetErrorString(herr),
+                                     __FILE__, __LINE__);
+    }
     record_physical_launch(1u);
     record_optimized_op();
     return OptimizedLaunchResult{OptimizedLaunchKind::Launched};
@@ -400,6 +437,8 @@ Result<OptimizedLaunchResult> try_launch_moe_combine(const Program& program,
     if (b.input_count != 3u || b.output_count != 1u)
         return bad("moe combine: bad io count");
 
+    const bool include_experts = (b.flags & 1u) != 0u;
+    const bool include_shared = (b.flags & 2u) != 0u;
     const Result<HostResolvedValue> expert_res =
         resolve_host_value(program, ValueId{b.input_slots[0]}, ctx);
     if (!expert_res.ok()) return expert_res.status();
@@ -417,39 +456,55 @@ Result<OptimizedLaunchResult> try_launch_moe_combine(const Program& program,
     if (!out_res.ok()) return out_res.status();
     const HostResolvedValue out = out_res.value();
 
-    if (expert.dtype != ValueDType::BF16 || shared.dtype != ValueDType::BF16 ||
-        out.dtype != ValueDType::BF16)
-        return bad("moe combine: expert / shared / output must be bf16");
-    if (gate.dtype != ValueDType::F32) return bad("moe combine: shared gate is not f32");
+    if (out.dtype != ValueDType::BF16)
+        return bad("moe combine: output must be bf16");
+    if (include_experts && expert.dtype != ValueDType::BF16)
+        return bad("moe combine: expert output must be bf16");
+    if (include_shared && (shared.dtype != ValueDType::BF16 ||
+                           gate.dtype != ValueDType::F32))
+        return bad("moe combine: shared value / gate dtype");
     if (expert.row_domain != ValueRowDomain::GROUPED_ROWS)
         return bad("moe combine: expert output is not in group rows");
     if (shared.row_domain != ValueRowDomain::TOKEN_ROWS ||
         out.row_domain != ValueRowDomain::TOKEN_ROWS)
         return bad("moe combine: shared or output is not one row per token");
-    if (expert.feature_count != out.feature_count || shared.feature_count != out.feature_count)
-        return bad("moe combine: feature count mismatch");
-    if (gate.feature_count != 1u) return bad("moe combine: shared gate is not one column");
-    if (gate.row_stride == 0u) return bad("moe combine: shared gate row stride is zero");
-    if (expert.ptr == nullptr || shared.ptr == nullptr || gate.ptr == nullptr ||
-        out.ptr == nullptr)
-        return bad("moe combine: value unbound");
-    if (expert.row_stride < expert.feature_count || shared.row_stride < shared.feature_count)
-        return bad("moe combine: row stride too small");
-    const ::shelf::runtime::ValueBinding* expert_binding =
-        program.find_value(ValueId{b.input_slots[0]});
-    if (expert_binding == nullptr) return bad("moe combine: expert output unbound");
-    const uint32_t elem = ::shelf::runtime::value_dtype_bytes(expert.dtype);
-    if (elem == 0u ||
-        expert_binding->bytes <
-            static_cast<uint64_t>(plan.value().row_capacity) * expert.row_stride * elem)
-        return bad("moe combine: group rows exceed the expert output plane");
+    if (include_experts && expert.feature_count != out.feature_count)
+        return bad("moe combine: expert feature count mismatch");
+    if (include_shared && shared.feature_count != out.feature_count)
+        return bad("moe combine: shared feature count mismatch");
+    if (include_shared && gate.feature_count != 1u)
+        return bad("moe combine: shared gate is not one column");
+    if (include_shared && gate.row_stride == 0u)
+        return bad("moe combine: shared gate row stride is zero");
+    if (out.ptr == nullptr) return bad("moe combine: output unbound");
+    if (include_experts && expert.ptr == nullptr) return bad("moe combine: expert unbound");
+    if (include_shared && (shared.ptr == nullptr || gate.ptr == nullptr))
+        return bad("moe combine: shared value unbound");
+    if (include_experts && expert.row_stride < expert.feature_count)
+        return bad("moe combine: expert row stride too small");
+    if (include_shared && shared.row_stride < shared.feature_count)
+        return bad("moe combine: shared row stride too small");
+    if (include_experts) {
+        const ::shelf::runtime::ValueBinding* expert_binding =
+            program.find_value(ValueId{b.input_slots[0]});
+        if (expert_binding == nullptr) return bad("moe combine: expert output unbound");
+        const uint32_t elem = ::shelf::runtime::value_dtype_bytes(expert.dtype);
+        if (elem == 0u ||
+            expert_binding->bytes <
+                static_cast<uint64_t>(plan.value().row_capacity) * expert.row_stride * elem)
+            return bad("moe combine: group rows exceed the expert output plane");
+    }
 
     const hipError_t herr = ::shelf::kernel::launch_moe_combine(
-        static_cast<::shelf::bf16_t*>(out.ptr), static_cast<const ::shelf::bf16_t*>(expert.ptr),
+        static_cast<::shelf::bf16_t*>(out.ptr),
+        include_experts ? static_cast<const ::shelf::bf16_t*>(expert.ptr) : nullptr,
         plan.value().arrays.sel_weight, plan.value().arrays.slot_row_of,
-        static_cast<const ::shelf::bf16_t*>(shared.ptr),
-        static_cast<const float*>(gate.ptr), plan.value().tokens, plan.value().top_k,
-        out.feature_count, expert.row_stride, shared.row_stride, gate.row_stride, stream);
+        include_shared ? static_cast<const ::shelf::bf16_t*>(shared.ptr) : nullptr,
+        include_shared ? static_cast<const float*>(gate.ptr) : nullptr,
+        plan.value().tokens, plan.value().top_k, out.feature_count,
+        include_experts ? expert.row_stride : out.feature_count,
+        include_shared ? shared.row_stride : out.feature_count,
+        include_shared ? gate.row_stride : 0u, include_experts, stream);
     if (herr != hipSuccess)
         return Status::hip_error("moe combine launch", hipGetErrorString(herr), __FILE__,
                                  __LINE__);

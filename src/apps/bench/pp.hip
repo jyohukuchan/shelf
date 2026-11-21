@@ -1,5 +1,6 @@
 
 #include <shelf/core/memory/arena.h>
+#include <shelf/core/memory/gpu_memory_manager.h>
 #include <shelf/runtime/execution/row_bucket.h>
 #include <shelf/models/loaded_model.h>
 #include <shelf/models/tp_rank_model.h>
@@ -81,6 +82,17 @@ void print_usage(FILE* out) {
         "  --kv-cache-dtype bf16|fp8|octave:FORMAT (default bf16)\n"
         "  --arena-gib N                (default auto = free VRAM minus 0.5 GiB)\n"
         "  --moe-host-experts N       routed experts per layer kept in host memory (default 0)\n"
+        "  --moe-cache-swap-budget N  expert cache swap budget (default 96)\n"
+        "  --moe-cache-min-gain N     minimum frequency gain to swap (default 150)\n"
+        "  --moe-cache-rebalance-steps N  rebalance interval in steps (default 4)\n"
+        "  --moe-cache-rebalance-routes N  rebalance interval in routes (0 = auto)\n"
+        "  --moe-cache-decay N        halve expert frequency at this count (default 4096)\n"
+        "  --moe-cache-log-interval N  expert cache hit-rate log interval (default 64)\n"
+        "  --moe-cache-oracle 0|1     log cache oracle decisions (default 0)\n"
+        "  --ple-artifact 0|1         write/read <model_dir>/quanted_ple.bin (default 1)\n"
+        "  --ple-stream-io MODE       pread | mmap | direct (default mmap)\n"
+        "  --ple-hot-cache-gib N      pinned host block cache for PLE (default 0)\n"
+        "  --lm-head-int8 0|1         quantize the BF16 lm head to INT8 W32 on load (default 1)\n"
         "  --pcie-frac F              share of PCIe the runtime may use (default 0.25)\n"
         "  --pcie-gbps F              assumed PCIe bandwidth in GB/s (default 25)\n"
 
@@ -114,6 +126,11 @@ static bool apply_env_double(const std::string& raw, const char* name) {
         fprintf(stderr, "invalid value for %s\n", name);
         return false;
     }
+    setenv(name, raw.c_str(), 1);
+    return true;
+}
+
+static bool apply_env_string(const std::string& raw, const char* name) {
     setenv(name, raw.c_str(), 1);
     return true;
 }
@@ -262,6 +279,43 @@ bool parse_args(int argc, char** argv, BenchOptions& opts) {
             opts.perf_stats_output = need_value();
         } else if (key == "--moe-host-experts") {
             if (!apply_env_u32(need_value(), "SHELF_MOE_HOST_EXPERTS")) return false;
+        } else if (key == "--moe-cache-swap-budget") {
+            if (!apply_env_u32(need_value(), "SHELF_MOE_CACHE_SWAP_BUDGET")) return false;
+        } else if (key == "--moe-cache-min-gain") {
+            if (!apply_env_u32(need_value(), "SHELF_MOE_CACHE_MIN_GAIN")) return false;
+        } else if (key == "--moe-cache-rebalance-steps") {
+            if (!apply_env_u32(need_value(), "SHELF_MOE_CACHE_REBALANCE_STEPS")) return false;
+        } else if (key == "--moe-cache-rebalance-routes") {
+            if (!apply_env_u32(need_value(), "SHELF_MOE_CACHE_REBALANCE_ROUTES")) return false;
+        } else if (key == "--moe-cache-oracle") {
+            const std::string value = need_value();
+            if (value != "0" && value != "1") {
+                fprintf(stderr, "invalid --moe-cache-oracle (expected 0 or 1)\n");
+                return false;
+            }
+            if (!apply_env_string(value, "SHELF_MOE_CACHE_ORACLE")) return false;
+        } else if (key == "--moe-cache-decay") {
+            if (!apply_env_u32(need_value(), "SHELF_MOE_CACHE_DECAY")) return false;
+        } else if (key == "--moe-cache-log-interval") {
+            if (!apply_env_u32(need_value(), "SHELF_MOE_CACHE_LOG_INTERVAL")) return false;
+        } else if (key == "--ple-artifact") {
+            const std::string value = need_value();
+            if (value != "0" && value != "1") {
+                fprintf(stderr, "invalid --ple-artifact (expected 0 or 1)\n");
+                return false;
+            }
+            if (!apply_env_string(value, "SHELF_PLE_ARTIFACT")) return false;
+        } else if (key == "--ple-stream-io") {
+            const std::string value = need_value();
+            if (value != "pread" && value != "mmap" && value != "direct") {
+                fprintf(stderr, "invalid --ple-stream-io (expected pread, mmap or direct)\n");
+                return false;
+            }
+            if (!apply_env_string(value, "SHELF_PLE_STREAM_IO")) return false;
+        } else if (key == "--ple-hot-cache-gib") {
+            if (!apply_env_u32(need_value(), "SHELF_PLE_HOT_CACHE_GIB")) return false;
+        } else if (key == "--lm-head-int8") {
+            if (!apply_env_u32(need_value(), "SHELF_LM_HEAD_INT8")) return false;
         } else if (key == "--pcie-frac") {
             if (!apply_env_double(need_value(), "SHELF_PCIE_FRAC")) return false;
         } else if (key == "--pcie-gbps") {
@@ -415,6 +469,7 @@ int run_pp(int argc, char** argv) {
     }
 
     hipStream_t stream = nullptr;
+    std::unique_ptr<shelf::gpu::GpuMemoryManager> tp_memory;
     std::unique_ptr<shelf::qwen35::runtime::TpCoordinator> tp_coordinator;
     std::optional<shelf::gpu::GpuArena> tp1_arena;
     std::optional<shelf::models::LoadedModel> tp1_loaded;
@@ -519,7 +574,14 @@ int run_pp(int argc, char** argv) {
                                     : opts.kv_cache_dtype == "fp8"
                                           ? shelf::kernel::KVCacheDType::FP8_E4M3
                                           : shelf::kernel::KVCacheDType::BF16;
-        tp_cfg.arena_bytes = arena_bytes;
+        auto memory_result = shelf::gpu::GpuMemoryManager::create(opts.devices, arena_bytes);
+        if (!memory_result.ok()) {
+            fprintf(stderr, "GpuMemoryManager::create failed: %s\n",
+                    memory_result.status().message().c_str());
+            return 1;
+        }
+        tp_memory = std::make_unique<shelf::gpu::GpuMemoryManager>(memory_result.release());
+        tp_cfg.memory = tp_memory.get();
         tp_cfg.working_set_reserve_bytes = 0;
         shelf::Status sel = shelf::models::select_tp_rank_model(tp_cfg);
         if (!sel.ok()) {

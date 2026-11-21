@@ -37,13 +37,13 @@ std::uint32_t count_attention_layers(const shelf::qwen_hybrid::QwenHybridConfig&
 }
 
 TpRankRuntime::~TpRankRuntime() noexcept {
-    if (executor_ready_) {
-        executor_shutdown(executor_);
-        executor_ready_ = false;
-    }
-    if (stream_ != nullptr) {
-        shelf::gpu::discard_cleanup_result(hipStreamDestroy(stream_));
-        stream_ = nullptr;
+    if (device_id_ >= 0) {
+        auto scope = shelf::gpu::ScopedDevice::create(device_id_);
+        (void)scope;
+        if (executor_ready_) {
+            (void)executor_shutdown(executor_);
+            executor_ready_ = false;
+        }
     }
 }
 
@@ -59,46 +59,20 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
         return Status::invalid_argument(
             "max_scheduled_requests and max_seq_len must be > 0", __FILE__, __LINE__);
     }
+    if (config.arena == nullptr || config.stream == nullptr) {
+        return Status::invalid_argument(
+            "tp rank runtime requires a borrowed arena and stream", __FILE__, __LINE__);
+    }
 
     auto scope = shelf::gpu::ScopedDevice::create(config.device_id);
     if (!scope.ok()) return scope.status();
 
     std::unique_ptr<TpRankRuntime> rank(new TpRankRuntime());
     rank->device_id_ = config.device_id;
+    rank->stream_ = config.stream;
 
-    const hipError_t stream_err = hipStreamCreate(&rank->stream_);
-    if (stream_err != hipSuccess) {
-        return Status::hip_error("hipStreamCreate tp rank", hipGetErrorString(stream_err),
-                                 __FILE__, __LINE__);
-    }
-
-    std::size_t arena_budget = config.arena_bytes;
-    if (arena_budget == 0) {
-        std::size_t free_bytes = 0;
-        std::size_t total_bytes = 0;
-        const hipError_t info_err = hipMemGetInfo(&free_bytes, &total_bytes);
-        if (info_err != hipSuccess) {
-            return Status::hip_error("hipMemGetInfo tp rank", hipGetErrorString(info_err),
-                                     __FILE__, __LINE__);
-        }
-        constexpr std::size_t kMarginBytes = 1ull * 1024ull * 1024ull * 1024ull;
-        const std::size_t available = free_bytes > kMarginBytes
-            ? free_bytes - kMarginBytes
-            : free_bytes / 2u;
-        if (available == 0) {
-            return Status::insufficient_memory(
-                "no VRAM available for the tp rank arena", __FILE__, __LINE__);
-        }
-        arena_budget = available;
-        std::fprintf(stderr,
-                     "ARENA auto: tp_rank=%u free=%s capacity=%s\n",
-                     config.tp_rank, gpu::format_gib(free_bytes).c_str(),
-                     gpu::format_gib(arena_budget).c_str());
-    }
-
-    auto arena_result = gpu::GpuArena::create(config.device_id, arena_budget);
-    if (!arena_result.ok()) return arena_result.status();
-    rank->arena_.emplace(arena_result.release());
+    gpu::GpuArena& arena = *config.arena;
+    rank->arena_ = config.arena;
 
     // The rank's model is the caller's choice: which family the checkpoint is, and therefore
     // which weights this rank loads and which local geometry it runs with, is not something
@@ -107,14 +81,15 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
         return Status::invalid_argument(
             "tp rank runtime requires a rank model builder", __FILE__, __LINE__);
     }
-    auto model_result = config.build_rank_model(config, rank->arena_.value(), rank->stream_);
+    auto model_result = config.build_rank_model(config, arena, rank->stream_);
     if (!model_result.ok()) return model_result.status();
     rank->model_ = model_result.release();
 
     const shelf::qwen_hybrid::QwenHybridConfig& tc = rank->hybrid_config();
     const std::uint32_t max_blocks_per_sequence =
         ceil_div(config.max_seq_len + 1u, config.page_tokens) + 1u;
-    const std::uint32_t attention_layers = count_attention_layers(tc);
+    const std::uint32_t attention_layers =
+        stage_attention_layers(tc, config.pipeline_stage);
     const std::uint32_t local_kv_heads = rank->context().local_key_value_heads;
     const std::uint32_t head_dim = static_cast<std::uint32_t>(tc.attention_head_dim);
 
@@ -127,12 +102,12 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
 
     const auto& rank_context = rank->context();
     const auto gdn_layout_result = make_gdn_state_layout_local(
-        tc, stage_gdn_layers(tc, {}), rank_context.local_gdn_key_heads,
+        tc, stage_gdn_layers(tc, config.pipeline_stage), rank_context.local_gdn_key_heads,
         rank_context.local_gdn_value_heads);
 
     if (config.load_private_weights && config.tp_rank == 0u) {
         Status private_status = config.load_private_weights(
-            rank->arena_.value(), rank->stream_, rank->private_lm_head_,
+            arena, rank->stream_, rank->private_lm_head_,
             rank->private_embed_tokens_);
         if (!private_status.ok()) return private_status;
     }
@@ -142,11 +117,11 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
     plan.draft_weights = config.drafter_weights_bytes;
 
     auto seq_result = SequenceSlotPool::create(
-        rank->arena_.value(), config.max_scheduled_requests, max_blocks_per_sequence);
+        arena, config.max_scheduled_requests, max_blocks_per_sequence);
     if (!seq_result.ok()) return seq_result.status();
     rank->seq_pool_.emplace(seq_result.release());
 
-    auto gdn_result = GdnStatePool::create(rank->arena_.value(),
+    auto gdn_result = GdnStatePool::create(arena,
                                            config.max_scheduled_requests,
                                            gdn_layout_result);
     if (!gdn_result.ok()) return gdn_result.status();
@@ -265,6 +240,15 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
                      gpu::format_gib(batch_bytes).c_str(),
                      static_cast<unsigned>(config.mtp_batch.max_requests));
     }
+    std::fprintf(stderr,
+                 "MEMORY_PLAN tp rank %u kv budget: free_after_weights=%s reserve=%s "
+                 "kv_budget=%s page=%s\n",
+                 static_cast<unsigned>(config.tp_rank),
+                 gpu::format_gib(arena_free_now).c_str(),
+                 gpu::format_gib(reserved).c_str(),
+                 gpu::format_gib(arena_free_now > reserved ? arena_free_now - reserved : 0u)
+                     .c_str(),
+                 gpu::format_gib(kv_page_bytes).c_str());
     if (arena_free_now <= reserved) {
         return Status::insufficient_memory(
             "tp rank arena has " + gpu::format_gib(arena_free_now) +
@@ -298,13 +282,14 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
                 ")",
             __FILE__, __LINE__);
     }
-    const std::uint32_t kv_pool_pages = fit_pages + 1u;
+    const std::uint32_t kv_pool_pages =
+        config.kv_pool_pages != 0u ? config.kv_pool_pages : fit_pages + 1u;
     plan.kv = static_cast<std::size_t>(kv_pool_pages) * kv_page_bytes;
-    plan.kv_tokens = fit_pages * config.page_tokens;
+    plan.kv_tokens = (kv_pool_pages - 1u) * config.page_tokens;
     rank->plan_ = plan;
 
     auto kv_result = PagedKVPool::create(
-        rank->arena_.value(), kv_pool_pages, config.page_tokens, attention_layers,
+        arena, kv_pool_pages, config.page_tokens, attention_layers,
         local_kv_heads, head_dim, config.kv_cache_dtype, config.octave_kv_format);
     if (!kv_result.ok()) return kv_result.status();
     rank->kv_pool_.emplace(kv_result.release());
@@ -329,14 +314,16 @@ Result<std::unique_ptr<TpRankRuntime>> TpRankRuntime::create(
         if (width != 0u) exec_config.normed_token_hidden_width = width;
     }
     exec_config.max_context_tokens = config.max_seq_len + 1u;
+    exec_config.pipeline_hidden_width = config.pipeline_hidden_width;
     exec_config.rope_profile = config.rope_profile;
+    exec_config.stage = config.pipeline_stage;
     exec_config.tp = &rank->context();
     exec_config.exl3_linear_shape = exl3_linear_shape;
 
     const std::size_t executor_before = rank->arena_->used();
     auto exec_result = rank->model_->create_executor(
         rank->seq_pool_.value(), rank->gdn_pool_.value(), rank->kv_pool_.value(),
-        rank->arena_.value(), exec_config);
+        arena, exec_config);
     std::fprintf(stderr,
                  "MEMORY_PLAN tp rank %u executor footprint: %s (reserve %s)\n",
                  static_cast<unsigned>(config.tp_rank),
@@ -396,7 +383,9 @@ std::uint64_t TpRankRuntime::gdn_state_bytes() const {
 }
 
 const char* TpCoordinator::transport_name() const noexcept {
-    return transport_ != nullptr ? transport_->name() : "none";
+    return !tp_groups_.empty() && tp_groups_.front().transport != nullptr
+        ? tp_groups_.front().transport->name()
+        : "none";
 }
 
 Result<std::unique_ptr<TpCoordinator>> TpCoordinator::create(
@@ -414,6 +403,36 @@ Result<std::unique_ptr<TpCoordinator>> TpCoordinator::create(
 
 Status TpCoordinator::initialize(const TpCoordinatorConfig& config) {
     devices_ = config.devices;
+    const std::uint32_t tp_size = config.tensor_parallel == 0u
+        ? static_cast<std::uint32_t>(devices_.size())
+        : config.tensor_parallel;
+    // Without an explicit EP group the routed experts follow the TP ranks (legacy layout):
+    // the expert group overlaps the tensor group instead of adding a device axis.
+    const bool explicit_ep = config.expert_parallel > 1u;
+    const std::uint32_t ep_size = explicit_ep ? config.expert_parallel : tp_size;
+    const std::size_t expected_devices = explicit_ep
+        ? static_cast<std::size_t>(ep_size) * tp_size
+        : tp_size;
+    if (devices_.empty() || tp_size == 0u || ep_size == 0u ||
+        devices_.size() != expected_devices) {
+        return Status::invalid_argument(
+            "tp coordinator device count does not match tensor_parallel / expert_parallel",
+            __FILE__, __LINE__);
+    }
+    if (config.memory == nullptr) {
+        return Status::invalid_argument(
+            "tp coordinator requires a GpuMemoryManager", __FILE__, __LINE__);
+    }
+    std::vector<gpu::GpuArena*> arenas(devices_.size(), nullptr);
+    std::vector<hipStream_t> streams(devices_.size(), nullptr);
+    for (std::size_t r = 0; r < devices_.size(); ++r) {
+        auto arena = config.memory->arena_for(devices_[r]);
+        if (!arena.ok()) return arena.status();
+        arenas[r] = arena.value();
+        auto stream = config.memory->stream_for(devices_[r]);
+        if (!stream.ok()) return stream.status();
+        streams[r] = stream.value();
+    }
 
     std::jthread model_prefetch;
     if (config.prefetch_rank_model != nullptr) {
@@ -422,10 +441,6 @@ Status TpCoordinator::initialize(const TpCoordinatorConfig& config) {
                 prefetch(model_dir);
             });
     }
-
-    auto transport_result = ::shelf::runtime::create_tp_transport(devices_);
-    if (!transport_result.ok()) return transport_result.status();
-    transport_ = std::move(transport_result.value().transport);
 
     struct RankSlot {
         std::unique_ptr<TpRankRuntime> runtime;
@@ -437,18 +452,30 @@ Status TpCoordinator::initialize(const TpCoordinatorConfig& config) {
     for (std::size_t r = 0; r < devices_.size(); ++r) {
         TpRankRuntimeConfig rank_config;
         rank_config.model_dir = config.model_dir;
-        rank_config.tp_size = static_cast<std::uint32_t>(devices_.size());
-        rank_config.tp_rank = static_cast<std::uint32_t>(r);
+        rank_config.tp_size = tp_size;
+        rank_config.tp_rank = static_cast<std::uint32_t>(r % tp_size);
+        rank_config.ep_size = ep_size;
+        rank_config.ep_rank = explicit_ep
+            ? static_cast<std::uint32_t>(r / tp_size)
+            : static_cast<std::uint32_t>(r % tp_size);
+        rank_config.ep_enabled = explicit_ep;
+        rank_config.expert_partition = explicit_ep
+            ? ExpertPartitionMode::AcrossEP
+            : (tp_size > 1u ? ExpertPartitionMode::LegacyAcrossTP
+                            : ExpertPartitionMode::Replicated);
         rank_config.device_id = devices_[r];
         rank_config.max_batch_rows = config.max_batch_rows;
         rank_config.max_scheduled_requests = config.max_scheduled_requests;
         rank_config.max_scheduled_output_rows = config.max_scheduled_output_rows;
         rank_config.max_seq_len = config.max_seq_len;
         rank_config.page_tokens = config.page_tokens;
+        rank_config.pipeline_hidden_width = config.pipeline_hidden_width;
         rank_config.kv_cache_dtype = config.kv_cache_dtype;
         rank_config.octave_kv_format = config.octave_kv_format;
-        rank_config.arena_bytes = config.arena_bytes;
+        rank_config.arena = arenas[r];
+        rank_config.stream = streams[r];
         rank_config.working_set_reserve_bytes = config.working_set_reserve_bytes;
+        rank_config.kv_pool_pages = config.kv_pool_pages;
         rank_config.drafter_config = config.drafter_config;
         rank_config.drafter_footprint = config.drafter_footprint;
         rank_config.mtp_reserve = config.mtp_reserve;
@@ -470,6 +497,7 @@ Status TpCoordinator::initialize(const TpCoordinatorConfig& config) {
         rank_config.rope_profile = config.rope_profile;
         rank_config.build_rank_model = config.build_rank_model;
         rank_config.load_options = config.load_options;
+        rank_config.pipeline_stage = config.pipeline_stage;
         rank_config.mtp_batch = config.mtp_batch;
         loaders.emplace_back(
             [&slots, r, rank_config = std::move(rank_config)]() {
@@ -489,23 +517,66 @@ Status TpCoordinator::initialize(const TpCoordinatorConfig& config) {
         ranks_.push_back(std::move(slot.runtime));
     }
 
-    Status verify_status = transport_->verify();
-    if (!verify_status.ok()) {
-        std::fprintf(stderr,
-                     "[tp] transport %s failed verification (%s); falling back to "
-                     "host-mediated reference transport\n",
-                     transport_->name(), verify_status.message().c_str());
-        transport_ = std::make_unique<::shelf::runtime::HostMediatedTpTransport>(devices_);
+    explicit_ep_ = explicit_ep;
+    ParallelShape shape;
+    shape.pp = 1u;
+    shape.ep = explicit_ep ? config.expert_parallel : 1u;
+    shape.tp = tp_size;
+    auto topology_result = ParallelTopology::create(shape, devices_);
+    if (!topology_result.ok()) return topology_result.status();
+    topology_.emplace(topology_result.release());
+
+    auto make_group = [&](const RankGroup& rank_group) -> Result<ReduceGroup> {
+        ReduceGroup group;
+        for (std::uint32_t member : rank_group.ranks) {
+            group.devices.push_back(topology_->device(member));
+        }
+        if (group.devices.size() < 2u) return group;
+        auto transport_result = ::shelf::runtime::create_tp_transport(group.devices);
+        if (!transport_result.ok()) return transport_result.status();
+        group.transport = std::move(transport_result.value().transport);
+        auto verify_status = group.transport->verify();
+        if (!verify_status.ok()) {
+            std::fprintf(stderr,
+                         "[tp] transport %s failed verification (%s); falling back to "
+                         "host-mediated reference transport\n",
+                         group.transport->name(), verify_status.message().c_str());
+            group.transport =
+                std::make_unique<::shelf::runtime::HostMediatedTpTransport>(group.devices);
+        }
+        group.barrier = std::make_unique<::shelf::runtime::TpBarrierGroup>(
+            static_cast<int>(group.devices.size()), group.devices, group.transport.get());
+        Status barrier_status = group.barrier->initialize();
+        if (!barrier_status.ok()) return barrier_status;
+        return group;
+    };
+
+    for (std::uint32_t e = 0; e < topology_->shape().ep; ++e) {
+        auto group = make_group(topology_->tp_group(0u, e));
+        if (!group.ok()) return group.status();
+        tp_groups_.push_back(group.release());
+    }
+    if (explicit_ep) {
+        ep_groups_.reserve(topology_->shape().tp);
+        for (std::uint32_t t = 0; t < topology_->shape().tp; ++t) {
+            auto group = make_group(topology_->ep_group(0u, t));
+            if (!group.ok()) return group.status();
+            ep_groups_.push_back(group.release());
+        }
     }
 
-    barrier_group_ = std::make_unique<::shelf::runtime::TpBarrierGroup>(
-        static_cast<int>(devices_.size()), devices_, transport_.get());
-    Status barrier_status = barrier_group_->initialize();
-    if (!barrier_status.ok()) return barrier_status;
-
     for (std::size_t r = 0; r < ranks_.size(); ++r) {
-        ranks_[r]->executor().tp_barrier = barrier_group_.get();
-        ranks_[r]->executor().tp_rank = static_cast<int>(r);
+        const ParallelCoord coord = topology_->coord(static_cast<std::uint32_t>(r));
+        auto& executor = ranks_[r]->executor();
+        if (explicit_ep) {
+            executor.tp_barrier = tp_groups_[coord.ep].barrier.get();
+            executor.tp_rank = static_cast<int>(coord.tp);
+            executor.ep_barrier = ep_groups_[coord.tp].barrier.get();
+            executor.ep_rank = static_cast<int>(coord.ep);
+        } else {
+            executor.tp_barrier = tp_groups_.front().barrier.get();
+            executor.tp_rank = static_cast<int>(coord.tp);
+        }
     }
 
     workers_.reserve(ranks_.size());
@@ -531,15 +602,19 @@ TpCoordinator::~TpCoordinator() noexcept {
     }
     workers_.clear();
     mirrors_.clear();
-    if (barrier_group_) barrier_group_->shutdown();
-    barrier_group_.reset();
-    transport_.reset();
+    tp_groups_.clear();
+    ep_groups_.clear();
     for (auto& rank : ranks_) rank.reset();
     ranks_.clear();
 }
 
 void TpCoordinator::abort(const Status& reason) noexcept {
-    if (barrier_group_) barrier_group_->abort(reason);
+    for (auto& group : tp_groups_) {
+        if (group.barrier) group.barrier->abort(reason);
+    }
+    for (auto& group : ep_groups_) {
+        if (group.barrier) group.barrier->abort(reason);
+    }
 }
 
 Status TpCoordinator::on_sequence_created(const PagedSequenceState& source) {
@@ -676,8 +751,10 @@ Result<BatchExecutionOutput> TpCoordinator::on_execute(
         return Status::unsupported(
             "tp speculative verify requires per-rank options", __FILE__, __LINE__);
     }
-    if (barrier_group_->aborted()) {
-        const Status reason = barrier_group_->abort_status();
+    const auto* aborted_barrier = explicit_ep_ ? ep_groups_.front().barrier.get()
+                                               : tp_groups_.front().barrier.get();
+    if (aborted_barrier != nullptr && aborted_barrier->aborted()) {
+        const Status reason = aborted_barrier->abort_status();
         if (!reason.ok()) return reason;
         return Status::invalid_state("tp barrier group is aborted", __FILE__, __LINE__);
     }
@@ -744,10 +821,14 @@ Result<BatchExecutionOutput> TpCoordinator::on_execute(
 
 Status TpCoordinator::draft_sum(const shelf::runtime::TpSumTarget& target,
                                 hipStream_t stream, int rank) {
-    if (barrier_group_ == nullptr) {
+    const ParallelCoord coord = topology_->coord(static_cast<std::uint32_t>(rank));
+    const std::size_t group_index = explicit_ep_ ? coord.ep : 0u;
+    const int local_rank = static_cast<int>(coord.tp);
+    auto* barrier = tp_groups_[group_index].barrier.get();
+    if (barrier == nullptr) {
         return Status::invalid_state("tp barrier group missing", __FILE__, __LINE__);
     }
-    return barrier_group_->arrive(rank, target, stream, false);
+    return barrier->arrive(local_rank, target, stream, false);
 }
 
 void TpCoordinator::worker_loop(std::size_t rank) {
@@ -805,7 +886,7 @@ Status TpCoordinator::run_rank_step(std::size_t rank, const ScheduledBatch& batc
 std::string TpCoordinator::debug_report() const {
     std::ostringstream out;
     out << "tp_size=" << ranks_.size() << " transport="
-        << (transport_ != nullptr ? transport_->name() : "none") << "\n";
+        << transport_name() << "\n";
     for (std::size_t r = 0; r < ranks_.size(); ++r) {
         const TpRankRuntime& runtime = *ranks_[r];
         out << "  rank" << r << " device=" << runtime.device_id()
