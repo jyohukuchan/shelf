@@ -115,6 +115,43 @@ std::vector<uint64_t> engram_indices(const Checkpoint &model, int g, const std::
     }
     return indices;
 }
+std::vector<uint8_t> gather_local_engram(const Checkpoint &model, int g, const std::vector<int> &prior,
+                                         const std::vector<int> &ids) {
+    size_t bytes = ids.size() * 16 * 98;
+    std::vector<uint8_t> storage;
+    if (model.ngram) {
+        const auto &heads = model.ngram_heads[g];
+        size_t stride = 0;
+        for (const auto &head : heads)
+            stride += 12 * head.bits + 2;
+        storage.resize(ids.size() * stride);
+        auto indices = engram_indices(model, g, prior, ids);
+        for (size_t r = 0; r < ids.size(); ++r) {
+            size_t dest_offset = r * stride, base = 0;
+            for (size_t h = 0; h < 16; ++h) {
+                const auto &head = heads[h];
+                size_t row = indices[r * 16 + h] - base, width = 12 * head.bits;
+                std::memcpy(storage.data() + dest_offset, head.codes + row * width, width);
+                std::memcpy(storage.data() + dest_offset + width, head.scales + row * 2, 2);
+                dest_offset += width + 2;
+                base += model.moduli[g][h];
+            }
+        }
+        return storage;
+    }
+    auto table = "model.layers." + std::to_string(1 + 10 * g) +
+                 ".engram_layer.multi_head_embedding.embedding.weight";
+    auto bits = static_cast<const uint8_t *>(model.at(table).host);
+    auto scales = static_cast<const uint8_t *>(model.at(table + ".scale").host);
+    auto indices = engram_indices(model, g, prior, ids);
+    storage.resize(bytes);
+    for (size_t i = 0; i < indices.size(); ++i) {
+        auto dest = storage.data() + i * 98;
+        std::memcpy(dest, bits + indices[i] * 96, 96);
+        std::memcpy(dest + 96, scales + indices[i] * 2, 2);
+    }
+    return storage;
+}
 struct EngramSource {
     Ops &op;
     void prefetch(const std::vector<int> &prior, const std::vector<int> &ids);
@@ -123,20 +160,32 @@ struct EngramSource {
 };
 void EngramSource::prefetch(const std::vector<int> &prior, const std::vector<int> &ids) {
 #ifdef SHELF_HY4_RDMA
-    if (!op.gpu.model.rdma)
+    if (op.gpu.model.rdma) {
+        rdma::Indices indices;
+        for (int g = 0; g < 4; ++g)
+            indices[g] = engram_indices(op.gpu.model, g, prior, ids);
+        auto client = op.gpu.engram_client.get();
+        op.gpu.engram_pending = std::async(std::launch::async, [client, indices = std::move(indices)] {
+            return client->read(indices);
+        });
         return;
-    rdma::Indices indices;
-    for (int g = 0; g < 4; ++g)
-        indices[g] = engram_indices(op.gpu.model, g, prior, ids);
-    auto client = op.gpu.engram_client.get();
-    op.gpu.engram_pending = std::async(std::launch::async, [client, indices = std::move(indices)] {
-        return client->read(indices);
-    });
-#else
-    (void)prior;
-    (void)ids;
+    }
 #endif
+    if (op.gpu.local_engram_pending.valid())
+        (void)op.gpu.local_engram_pending.get();
+    op.gpu.local_engram_rows = {};
+    auto enabled = std::getenv("SHELF_HY4_ENGRAM_PREFETCH");
+    if (enabled && std::string_view(enabled) == "0")
+        return;
+    auto *model = &op.gpu.model;
+    op.gpu.local_engram_pending = std::async(std::launch::async, [model, prior, ids] {
+        std::array<std::vector<uint8_t>, 4> result;
+        for (int g = 0; g < 4; ++g)
+            result[g] = gather_local_engram(*model, g, prior, ids);
+        return result;
+    });
 }
+
 std::span<const uint8_t> EngramSource::rows(int g, const std::vector<int> &prior, const std::vector<int> &ids,
                                            std::vector<uint8_t> &storage) {
     size_t bytes = ids.size() * 16 * 98;
@@ -150,39 +199,17 @@ std::span<const uint8_t> EngramSource::rows(int g, const std::vector<int> &prior
         return result;
     }
 #endif
-    if (op.gpu.model.ngram) {
-        const auto &heads = op.gpu.model.ngram_heads[g];
-        size_t stride = 0;
-        for (const auto &head : heads)
-            stride += 12 * head.bits + 2;
-        storage.resize(ids.size() * stride);
-        auto indices = engram_indices(op.gpu.model, g, prior, ids);
-        for (size_t r = 0; r < ids.size(); ++r) {
-            size_t dest_offset = r * stride, base = 0;
-            for (size_t h = 0; h < 16; ++h) {
-                const auto &head = heads[h];
-                size_t row = indices[r * 16 + h] - base, width = 12 * head.bits;
-                std::memcpy(storage.data() + dest_offset, head.codes + row * width, width);
-                std::memcpy(storage.data() + dest_offset + width, head.scales + row * 2, 2);
-                dest_offset += width + 2;
-                base += op.gpu.model.moduli[g][h];
-            }
-        }
+    if (op.gpu.local_engram_pending.valid()) {
+        op.gpu.local_engram_rows = op.gpu.local_engram_pending.get();
+    }
+    if (!op.gpu.local_engram_rows[g].empty()) {
+        storage = std::move(op.gpu.local_engram_rows[g]);
         return storage;
     }
-    auto table = "model.layers." + std::to_string(1 + 10 * g) +
-                 ".engram_layer.multi_head_embedding.embedding.weight";
-    auto bits = static_cast<const uint8_t *>(op.gpu.model.at(table).host);
-    auto scales = static_cast<const uint8_t *>(op.gpu.model.at(table + ".scale").host);
-    auto indices = engram_indices(op.gpu.model, g, prior, ids);
-    storage.resize(bytes);
-    for (size_t i = 0; i < indices.size(); ++i) {
-        auto dest = storage.data() + i * 98;
-        std::memcpy(dest, bits + indices[i] * 96, 96);
-        std::memcpy(dest + 96, scales + indices[i] * 2, 2);
-    }
+    storage = gather_local_engram(op.gpu.model, g, prior, ids);
     return storage;
 }
+
 void prefetch_engram(Ops &op, const std::vector<int> &prior, const std::vector<int> &ids) {
     EngramSource{op}.prefetch(prior, ids);
 }

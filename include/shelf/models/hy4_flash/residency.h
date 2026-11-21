@@ -3,9 +3,9 @@
 #include <shelf/core/memory/arena.h>
 #include <shelf/kernels/hy4_flash/linear.h>
 #include <shelf/models/hy4_flash/checkpoint.h>
+#include <future>
 #ifdef SHELF_HY4_RDMA
 #include <shelf/models/hy4_flash/rdma/client.h>
-#include <future>
 #endif
 
 namespace shelf::hy4 {
@@ -31,6 +31,8 @@ struct Residency {
     std::array<uint8_t, 32> snapshot_engram_digest{};
     bool snapshot_engram_digest_ready = false;
 #endif
+    std::future<std::array<std::vector<uint8_t>, 4>> local_engram_pending;
+    std::array<std::vector<uint8_t>, 4> local_engram_rows;
     Checkpoint &model;
     size_t tokens;
     std::array<int, 3> physical{0, 1, 2};
