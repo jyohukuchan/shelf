@@ -12,6 +12,17 @@ int main() {
             ++failures;
         }
     };
+    check(select_reduce_transport(true, true, false) == ReduceTransport::push,
+          "送信側が到達できる場合に push が選択されません");
+    check(select_reduce_transport(true, false, true) == ReduceTransport::host,
+          "送信側が到達できない push が host に切り替わりません");
+    check(select_reduce_transport(false, false, true) == ReduceTransport::peer,
+          "受信側が到達できる場合に peer が選択されません");
+    check(select_reduce_transport(false, true, false) == ReduceTransport::host,
+          "受信側が到達できない peer が host に切り替わりません");
+    check(multi_gpu_vmm_allowed(1, "1") && multi_gpu_vmm_allowed(3, "0") &&
+              !multi_gpu_vmm_allowed(3, "1"),
+          "GPU 数と VMM 設定の検証が不正です");
     for (int rows : {1, 8, 24, 1024}) {
         for (int ranks : {1, 3, 4}) {
             std::array<int, 512> owners{};

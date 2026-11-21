@@ -5,10 +5,19 @@
 #include <array>
 #include <cmath>
 #include <stdexcept>
+#include <string_view>
 #include <numeric>
 #include <vector>
 
 namespace shelf::hy4 {
+enum class ReduceTransport { push, peer, host };
+inline ReduceTransport select_reduce_transport(bool push, bool source_access, bool destination_access) {
+    return push ? (source_access ? ReduceTransport::push : ReduceTransport::host)
+                : (destination_access ? ReduceTransport::peer : ReduceTransport::host);
+}
+inline bool multi_gpu_vmm_allowed(int ranks, std::string_view mode) {
+    return ranks <= 1 || mode != "1";
+}
 inline void partition_routes(std::vector<Hy4Route> &host, int rows, const std::array<int, 512> &owners,
                              int ranks, std::array<std::vector<Hy4Route>, 4> &routes,
                              std::array<std::vector<int>, 4> &offsets) {

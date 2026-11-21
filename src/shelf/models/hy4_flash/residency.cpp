@@ -56,7 +56,7 @@ Residency::~Residency() noexcept {
 }
 void Residency::reserve() {
     auto vmm = std::getenv("SHELF_ARENA_VMM");
-    if (vmm && std::string_view(vmm) == "1")
+    if (!multi_gpu_vmm_allowed(3, vmm ? vmm : ""))
         throw std::runtime_error("Hy4 の複数 GPU 実行では SHELF_ARENA_VMM=1 を使用できません");
     int count = 0;
     check(hipGetDeviceCount(&count));
@@ -218,7 +218,7 @@ void Residency::upload() {
         for (int src = 0; src < 3; ++src) {
             if (src == dst || (dst && src))
                 continue;
-            bool available = push ? peer[src][dst] : peer[dst][src];
+            bool available = select_reduce_transport(push, peer[src][dst], peer[dst][src]) != ReduceTransport::host;
             if (available) {
                 for (int q = 0; q < 2; ++q) {
                     check(hipSetDevice(physical[src]));
@@ -350,7 +350,7 @@ void Residency::transfer(void *dst, int destination, const void *src, int source
     std::chrono::steady_clock::time_point begin;
     if (expert_begin[0])
         begin = std::chrono::steady_clock::now();
-    if (push ? peer[source][destination] : peer[destination][source]) {
+    if (select_reduce_transport(push, peer[source][destination], peer[destination][source]) != ReduceTransport::host) {
         int p = parity[source][destination];
         parity[source][destination] ^= 1;
         auto ready_event = ready[source][destination][p];
